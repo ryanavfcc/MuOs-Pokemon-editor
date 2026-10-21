@@ -52,7 +52,7 @@ if __name__ == '__main__':
     with (ROOT/'sprite-index.csv').open('w',newline='') as fp:
         writer=csv.writer(fp);writer.writerow(['national_dex','pokemon_name','png_sha256','sprite_source'])
         for dex in range(1,387):
-            writer.writerow([dex,names[dex],hashes[dex],f'{BASE}/{dex}.png'])
+            writer.writerow([dex,names[dex],hashes[dex-1],f'{BASE}/{dex}.png'])
     # A review sheet of *every* species is part of the GitHub artifact.
     # This deliberately uses National Dex numbers, not Gen 3 internal IDs.
     cols=12;rows=(386+cols-1)//cols
