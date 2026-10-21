@@ -1,3 +1,4 @@
+#define _GNU_SOURCE
 
 #include <SDL2/SDL.h>
 #include <stdio.h>
@@ -17,9 +18,10 @@
 #define SECTION_SIZE 4096
 static char files[MAX_FILES][512];
 static int count=0, selected=0, pokemon=0, species=1, detail=0, status=0, bag_index=0, bag_qty=50, tab=0, box_num=0, box_slot=0, box_species=1;
-static uint8_t data[SAVE_SIZE];
+static uint8_t data[SAVE_SIZE], snapshot[SAVE_SIZE];
 static int dirty=0, confirming=0, odds_index=0, egg_species=1, edit_field=0, folder_view=0, root_index=0;
-static int catalog_game=0, delete_confirm=0, event_index=0, save_game=0, save_slot_valid[2]={0,0}, tool_cursor=0;
+static int catalog_game=0, delete_confirm=0, event_index=0, save_game=0, save_slot_valid[2]={0,0}, tool_cursor=0, creator_dex=151, bag_raw_mode=0, import_mode=0, import_cursor=0;
+static int enc_dex=151, enc_level=30, enc_field=0, enc_mode=0;
 static char root_custom[512]="";
 static const char *root_paths[]={"/run/muos/storage/save", "/run/muos/storage/roms", "/mnt/mmc/SAVES", "/mnt/sdcard/SAVES", "/mnt/mmc/ROMS", "/mnt/sdcard/ROMS", "/mnt/mmc/RetroArch/saves", "/mnt/sdcard/RetroArch/saves", "/mnt/mmc/MUOS/save", "/mnt/sdcard/MUOS/save", "/mnt/mmc", "/mnt/sdcard"};
 #define ROOT_COUNT ((int)(sizeof(root_paths)/sizeof(root_paths[0])))
@@ -67,7 +69,7 @@ static int load(const char *path){
  save_slot_valid[0]=va;save_slot_valid[1]=vb;
  if(!va&&!vb)return 0;
  active=vb&&(!va||(int32_t)(cb-ca)>0)?1:0;
- memcpy(sec,active?b:a,sizeof(sec));dirty=0;return 1;
+ memcpy(sec,active?b:a,sizeof(sec));memcpy(snapshot,data,SAVE_SIZE);dirty=0;return 1;
 }
 static int party_count(void){
  int n=rd32(data+sec[1]*SECTION_SIZE+0x234);
@@ -197,30 +199,66 @@ static const BagItem em_items[]={
 static const char *catalog_names[]={"RUBY SAPPHIRE","FIRERED LEAFGREEN","EMERALD"};
 static int bag_choice_count(void){return catalog_game==0?(int)(sizeof(rs_items)/sizeof(rs_items[0])):catalog_game==1?(int)(sizeof(frlg_items)/sizeof(frlg_items[0])):(int)(sizeof(em_items)/sizeof(em_items[0]));}
 static const BagItem *bag_choice(void){return catalog_game==0?&rs_items[bag_index]:catalog_game==1?&frlg_items[bag_index]:&em_items[bag_index];}
-static int add_bag_item(int choice,int qty){
- if(save_game!=1)return 0;
- if(active<0||catalog_game!=0||choice<0||choice>=bag_choice_count()||qty<1||qty>99)return 0;
- const BagItem *item=&rs_items[choice];
- if(item->offset==0x5b0)qty=1;
- uint8_t *p=data+sec[1]*SECTION_SIZE+item->offset;
- int free_slot=-1;
- for(int i=0;i<item->slots;i++){
-  uint16_t id=rd16(p+i*4),amount=rd16(p+i*4+2);
-  if(id==item->id){
-   if(item->offset==0x5b0)return 1;
-   if(amount+qty>99)return 0;
-   wr16(p+i*4+2,amount+qty);
-   goto done;
+/* Pocket offsets are offsets inside logical section 1 (SaveBlock1).
+   FRLG/E quantity fields are encrypted using SaveBlock2's security key. */
+static void recompute_section(int sid);
+typedef struct {int offset,slots;} Pocket;
+static Pocket pocket_for(int game,int kind){
+ static const Pocket p[3][5]={
+  {{0x560,20},{0x5b0,20},{0x600,16},{0x640,64},{0x740,46}},
+  {{0x310,42},{0x3b8,30},{0x430,13},{0x464,58},{0x54c,43}},
+  {{0x560,30},{0x5d8,30},{0x650,16},{0x690,64},{0x790,46}}
+ };
+ int row=game==1?0:(game==2||game==3)?1:game==4?2:-1;
+ Pocket bad={0,0};return row<0||kind<0||kind>4?bad:p[row][kind];
+}
+static uint16_t item_key(void){
+ if(save_game==1)return 0;
+ const uint8_t *s=data+sec[0]*SECTION_SIZE;
+ return (uint16_t)rd32(s+(save_game==4?0xac:0xf20));
+}
+static int item_pocket(uint16_t id){
+ if(id>=1&&id<=12)return 2;
+ if(id>=133&&id<=175)return 4;
+ if(id>=289&&id<=346)return 3;
+ if(id>=259&&id<=288)return 1;
+ if(id>=349&&id<=376)return 3;
+ if(id>=500&&id<=575)return 1;
+ return 0;
+}
+static uint16_t active_item_id(void){
+ if(bag_raw_mode)return (uint16_t)(bag_index+1);
+ return bag_choice()->id;
+}
+static int add_item_by_id(uint16_t id,int qty){
+ if(active<0||save_game==0||id==0||qty<1||qty>999)return 0;
+ int kind=item_pocket(id);
+ Pocket pocket=pocket_for(save_game,kind);
+ if(!pocket.slots)return 0;
+ if(kind==1)qty=1;
+ uint8_t *p=data+sec[1]*SECTION_SIZE+pocket.offset;
+ int free_slot=-1;uint16_t key=item_key();
+ for(int i=0;i<pocket.slots;i++){
+  uint16_t found=rd16(p+i*4);
+  if(found==id){
+   int old=rd16(p+i*4+2)^key;
+   if(kind==1)return 1;
+   if(old+qty>999)return 0;
+   wr16(p+i*4+2,(uint16_t)(old+qty)^key);
+   recompute_section(1);dirty=1;return 1;
   }
-  if(id==0&&free_slot<0)free_slot=i;
+  if(!found&&free_slot<0)free_slot=i;
  }
  if(free_slot<0)return 0;
- wr16(p+free_slot*4,item->id);
- wr16(p+free_slot*4+2,qty);
-done:
- {uint8_t *section=data+sec[1]*SECTION_SIZE;wr16(section+0xff6,checksum(section,lengths[1]));}
- dirty=1;
- return 1;
+ wr16(p+free_slot*4,id);wr16(p+free_slot*4+2,(uint16_t)qty^key);
+ recompute_section(1);dirty=1;return 1;
+}
+static int add_bag_item(int choice,int qty){
+ if(!bag_raw_mode&&(catalog_game!=0&&save_game==1))return 0;
+ if(!bag_raw_mode&&(catalog_game==0&&save_game!=1))return 0;
+ if(!bag_raw_mode&&(catalog_game==1&&(save_game!=2&&save_game!=3)))return 0;
+ if(!bag_raw_mode&&(catalog_game==2&&save_game!=4))return 0;
+ (void)choice;return add_item_by_id(active_item_id(),qty);
 }
 static int save_bag_copy(void){
  if(active<0)return 0;
@@ -317,7 +355,7 @@ static void encrypt_mon(uint8_t mon[80],const uint8_t plain[48]){
  wr16(mon+28,(uint16_t)sum);
 }
 static int edit_box_field(int field,int adjustment){
- if(save_game!=1)return 0;
+ if(save_game<1)return 0;
  uint8_t mon[80], plain[48];
  if(!box_read(box_num,box_slot,mon)||!validate_box_mon(mon))return 0;
  decrypt_mon(mon,plain);
@@ -354,7 +392,7 @@ static uint32_t egg_rng(void){
  state^=state<<13;state^=state>>17;state^=state<<5;return state;
 }
 static int egg_create(void){
- if(save_game!=1)return 0;
+ if(save_game<1)return 0;
  uint8_t mon[80],plain[48];
  if(!box_read(box_num,box_slot,mon)||!validate_box_mon(mon))return 0;
  int destbox=-1,destslot=-1;
@@ -406,62 +444,235 @@ static int egg_create(void){
 /* PC deletion: replace an occupied, checksum-valid Pokemon with a blank
    80-byte record, preserving every other record and section. */
 static int box_delete(void){
- if(save_game!=1)return 0;
+ if(save_game<1)return 0;
  uint8_t mon[80],empty[80]={0};
  if(!box_read(box_num,box_slot,mon)||!validate_box_mon(mon))return 0;
  if(!storage_write(4+(box_num*30+box_slot)*80,empty,80))return 0;
  recompute_pc();dirty=1;return 1;
 }
-typedef struct{const char *name;uint16_t species;} EventPokemon;
-static const EventPokemon event_pokemon[]={
- {"MEW",151},{"CELEBI",251},{"LUGIA",249},{"HO OH",250},
- {"JIRACHI",407},{"DEOXYS",410}
+/* Offline catalogue: these are HISTORICAL EVENT REFERENCES, not archived
+   original PK3 files. They are reconstructed using the creator and never
+   described as original distribution specimens. */
+typedef struct {const char *name;int dex;} EventPreset;
+static const EventPreset event_pokemon[]={
+ {"WISHMKR JIRACHI",385},{"CHANNEL JIRACHI",385},
+ {"MYSTRY MEW",151},{"AURA MEW",151},{"HADOU MEW",151},
+ {"SPACE C DEOXYS",386},{"DOEL DEOXYS",386},
+ {"AGETO CELEBI",251},{"MITSURIN CELEBI",251},
+ {"ROCKS METANG",375},{"BERRY FIX ZIGZAGOON",263},
+ {"POKEPARK MEW",151},{"POKEPARK CELEBI",251},
+ {"TANABATA JIRACHI",385},{"NEGAIBOSHI JIRACHI",385},
+ {"POKEPARK MEOWTH",52},{"ANA PIKACHU",25},
+ {"FESTA METANG",375},{"SUNDAY WOBBUFFET",202},
+ {"HADOU REGICE",378},{"HADOU REGISTEEL",379},
+ {"GW PIKACHU",25},{"YOKOHAMA PIKACHU",25}
 };
 #define EVENT_COUNT ((int)(sizeof(event_pokemon)/sizeof(event_pokemon[0])))
-/* Create an experimental boxed Pokemon using a valid existing Pokemon
-   as the template. This creates no Mystery Gift card, Wonder Card, or
-   event flags. Its moves, IVs, EVs and encounter data originate from
-   the template: generated Pokemon are NOT legality-verified. */
-static int event_spawn(void){
- if(save_game!=1)return 0;
- uint8_t mon[80],plain[48],out[80];
- if(!box_read(box_num,box_slot,mon)||!validate_box_mon(mon))return 0;
- int db=-1,ds=-1;
- for(int b=0;b<14&&db<0;b++)for(int j=0;j<30;j++){
-  uint8_t other[80];if(!box_read(b,j,other))return 0;
-  if(rd32(other)==0&&rd32(other+4)==0){db=b;ds=j;break;}
+static int dex_to_internal(int dex){return dex<=251?dex:dex<=386?dex+25:0;}
+/* 0 creator, 1 reconstructed historical reference, 2 external PK3 import */
+static int creator_mode=0,creator_field=0,creator_level=5,creator_nature=0;
+static int creator_ability=0,creator_item=0,creator_iv=20,creator_ev=0;
+static int creator_shiny=0,creator_moves[4]={33,0,0,0};
+static uint32_t creator_seed=0;
+static uint32_t creator_random(void){
+ if(!creator_seed)creator_seed=(uint32_t)time(NULL)^((uint32_t)clock()<<11)^0xA5319B47u;
+ creator_seed^=creator_seed<<13;creator_seed^=creator_seed>>17;creator_seed^=creator_seed<<5;
+ return creator_seed?creator_seed:0x9e3779b9u;
+}
+static int creator_empty_slot(int *b,int *s){
+ for(int box=0;box<14;box++)for(int slot=0;slot<30;slot++){
+  uint8_t mon[80];if(!box_read(box,slot,mon))return 0;
+  if(rd32(mon)==0&&rd32(mon+4)==0){*b=box;*s=slot;return 1;}
  }
- if(db<0)return 0;
- decrypt_mon(mon,plain);
- int growth=growth_pos(rd32(mon)%24)*12;
- wr16(plain+growth,event_pokemon[event_index].species);
- wr16(plain+growth+2,0);/* no held item */
- static const char *orders[]={"GAEM","GAME","GEAM","GEMA","GMAE","GMEA","AGEM","AGME","AEGM","AEMG","AMGE","AMEG","EGAM","EGMA","EAGM","EAMG","EMGA","EMAG","MGAE","MGEA","MAGE","MAEG","MEGA","MEAG"};
- int mpos=0;while(mpos<4&&orders[rd32(mon)%24][mpos]!='M')mpos++;
- if(mpos>=4)return 0;
- wr32(plain+mpos*12+4,rd32(plain+mpos*12+4)&~(1u<<30));
- memcpy(out,mon,80);
- /* Clear has-nickname and egg flags so game provides species name. */
- out[19]&=(uint8_t)~(0x04|0x02);
- memset(out+8,0xff,10);
- /* Nonzero PID generated for a distinct Pokemon identity; preserve
-    encryption permutation by limiting PID to same mod-24. */
- uint32_t oldpid=rd32(mon),newpid=egg_rng();
- newpid-=newpid%24;newpid+=oldpid%24;
- if(newpid==0)newpid+=24;
- wr32(out,newpid);
- encrypt_mon(out,plain);
- if(!storage_write(4+(db*30+ds)*80,out,80))return 0;
- recompute_pc();dirty=1;return 1;
+ return 0;
+}
+/* GBA character encoding for uppercase Latin names and digits. */
+static void gba_name(uint8_t *dst,int cap,const char *name){
+ memset(dst,0xff,(size_t)cap);
+ for(int i=0;i<cap-1&&name[i];i++){
+  char ch=name[i];
+  if(ch>='A'&&ch<='Z')dst[i]=(uint8_t)(0xBB+ch-'A');
+  else if(ch>='0'&&ch<='9')dst[i]=(uint8_t)(0xA1+ch-'0');
+  else if(ch==' ')dst[i]=0;
+  else break;
+ }
+}
+static int creator_generate(int dex,int reconstructed){
+ if(save_game<1||dex<1||dex>386)return 0;
+ int b=-1,s=-1;if(!creator_empty_slot(&b,&s))return 0;
+ uint8_t mon[80]={0},plain[48]={0};
+ /* Trainer ID at saveblock2 + 0xA in Gen 3 GBA games. */
+ uint32_t tid=rd32(data+sec[0]*SECTION_SIZE+0x0a);
+ uint32_t pid=0;
+ /* Choose personality with exactly the requested nature and shiny flag. */
+ if(creator_shiny){
+  uint16_t tsv=(uint16_t)((tid&65535)^(tid>>16));
+  for(int attempt=0;attempt<2000;attempt++){
+   uint16_t low=(uint16_t)creator_random();
+   uint16_t high=(uint16_t)(low^tsv^(creator_random()&7));
+   pid=((uint32_t)high<<16)|low;
+   if((int)(pid%25)==creator_nature)break;
+  }
+ }else{
+  for(int attempt=0;attempt<2000;attempt++){
+   pid=creator_random();
+   if((int)(pid%25)==creator_nature &&
+     (((tid&65535)^(tid>>16)^(pid&65535)^(pid>>16))>=8))break;
+  }
+ }
+ if((int)(pid%25)!=creator_nature)return 0;
+ wr32(mon,pid);wr32(mon+4,tid);
+ /* A generic, valid nickname is used because species-specific GBA strings
+    require a complete localized species-name table. */
+ char nick[12];snprintf(nick,sizeof(nick),"PKMN%d",dex);
+ gba_name(mon+8,10,nick);gba_name(mon+20,7,"EDITOR");
+ mon[18]=2; /* English language */
+ mon[19]=(uint8_t)(creator_ability?1:0); /* flag bit zero is not ability;
+   actual ability selection is encrypted in misc origins bit 31 below */
+ mon[19]=2; /* marked nickname */
+ uint32_t growth=0;
+ wr16(plain+growth,dex_to_internal(dex));
+ wr16(plain+growth+2,(uint16_t)creator_item);
+ /* Level is not a field in boxed PK3. Set experience as a medium-fast
+    approximation; actual level depends on species growth group. */
+ uint32_t exp=(uint32_t)creator_level*creator_level*creator_level;
+ wr32(plain+growth+4,exp);
+ plain[growth+9]=70; /* friendship */
+ /* Order GAEM, chosen through PID %24 == 0? PID permutation may vary.
+    Reorder logical G/A/E/M into permutation dictated by PID. */
+ uint8_t logical[48];memcpy(logical,plain,48);
+ /* Attacks substructure occupies logical bytes 12..23. */
+ for(int i=0;i<4;i++)wr16(logical+12+i*2,(uint16_t)creator_moves[i]);
+ for(int i=0;i<4;i++)logical[20+i]=creator_moves[i]?35:0;
+ for(int i=0;i<6;i++)logical[24+i]=(uint8_t)creator_ev;
+ /* IVs packed, 6x 5-bit; personality controls nature. */
+ uint32_t iv=0;for(int i=0;i<6;i++)iv|=(uint32_t)creator_iv<<(5*i);
+ wr32(logical+40,iv);
+ /* Origin info: level at capture and game-of-origin are descriptive only.
+    Do not forge a historical event's OT or encounter data. */
+ wr16(logical+36,(uint16_t)(creator_level|(save_game==1?1u<<7:4u<<7)));
+ if(creator_ability)wr32(logical+40,rd32(logical+40)|(1u<<31));
+ static const char *orders[]={"GAEM","GAME","GEAM","GEMA","GMAE","GMEA",
+ "AGEM","AGME","AEGM","AEMG","AMGE","AMEG",
+ "EGAM","EGMA","EAGM","EAMG","EMGA","EMAG",
+ "MGAE","MGEA","MAGE","MAEG","MEGA","MEAG"};
+ const char *perm=orders[pid%24];uint8_t arranged[48];
+ for(int j=0;j<4;j++){
+  int block=perm[j]=='G'?0:perm[j]=='A'?1:perm[j]=='E'?2:3;
+  memcpy(arranged+j*12,logical+block*12,12);
+ }
+ encrypt_mon(mon,arranged);
+ if(!validate_box_mon(mon))return 0;
+ if(!storage_write(4+(b*30+s)*80,mon,80))return 0;
+ recompute_pc();dirty=1;
+ (void)reconstructed;
+ return 1;
+}
+static int event_spawn(void){
+ /* Preset changes dex, but does NOT claim authentic event data. */
+ int dex=event_pokemon[event_index].dex;
+ return creator_generate(dex,1);
+}
+static int creator_change(int field,int delta){
+ int *value=NULL,low=0,high=0;
+ switch(field){
+  case 0:value=&creator_dex;low=1;high=386;break;
+  case 1:value=&creator_level;low=1;high=100;break;
+  case 2:value=&creator_nature;low=0;high=24;break;
+  case 3:value=&creator_ability;low=0;high=1;break;
+  case 4:value=&creator_item;low=0;high=376;break;
+  case 5:case 6:case 7:case 8:value=&creator_moves[field-5];low=0;high=354;break;
+  case 9:value=&creator_iv;low=0;high=31;break;
+  case 10:value=&creator_ev;low=0;high=42;break;
+  case 11:value=&creator_shiny;low=0;high=1;break;
+  default:return 0;
+ }
+ int next=*value+delta;if(next<low)next=low;if(next>high)next=high;
+ *value=next;return 1;
 }
 /* Always save to the original RetroArch filename after a verified backup.
    Use an adjacent temporary file and atomic rename to avoid partial writes. */
+/* Experimental direct installation of a game-specific RetroArch cheat.
+   Never overwrite existing cheats or patch RetroArch's global config. */
+static int find_cheats_root(char *out,size_t cap){
+ const char *env=getenv("LIBRETRO_CHEATS_DIRECTORY");
+ if(env&&*env){struct stat st;if(!stat(env,&st)&&S_ISDIR(st.st_mode)){
+   snprintf(out,cap,"%s",env);return 1;}}
+ const char *cfgs[]={"/run/muos/storage/info/config/retroarch.cfg",
+                     "/opt/muos/share/info/config/retroarch.cfg",
+                     "/mnt/mmc/MUOS/info/config/retroarch.cfg",
+                     "/mnt/sdcard/MUOS/info/config/retroarch.cfg"};
+ for(int i=0;i<4;i++){
+  FILE *f=fopen(cfgs[i],"r");if(!f)continue;
+  char line[1024];while(fgets(line,sizeof(line),f)){
+   char value[700];
+   if(sscanf(line," cheat_database_path = \"%699[^\"]\"",value)==1){
+    struct stat st;
+    if(!stat(value,&st)&&S_ISDIR(st.st_mode)){
+     snprintf(out,cap,"%s",value);fclose(f);return 1;
+    }
+   }
+  }
+  fclose(f);
+ }
+ const char *roots[]={"/run/muos/storage/retroarch/cheats",
+                      "/mnt/mmc/MUOS/retroarch/cheats",
+                      "/mnt/sdcard/MUOS/retroarch/cheats"};
+ for(int i=0;i<3;i++){struct stat st;
+  if(!stat(roots[i],&st)&&S_ISDIR(st.st_mode)){
+   snprintf(out,cap,"%s",roots[i]);return 1;
+  }}
+ return 0;
+}
+static int export_encounter(void){
+ if(save_game!=2&&save_game!=3)return 0;
+ if(enc_dex<1||enc_dex>386||enc_level<1||enc_level>99)return 0;
+ int sid=dex_to_internal(enc_dex);
+ if(sid<1||sid>411)return 0;
+ char root[700],sub[900],dst[1100];
+ if(!find_cheats_root(root,sizeof(root)))return 0;
+ /* RetroArch stores game-specific cheats in a core-named subdirectory.
+    The exact core title can vary across versions; try established folders. */
+ const char *cores[]={"mGBA","Nintendo - Game Boy Advance (mGBA)","gpSP"};
+ int found=0;
+ for(int i=0;i<3;i++){
+  snprintf(sub,sizeof(sub),"%s/%s",root,cores[i]);
+  struct stat st;if(!stat(sub,&st)&&S_ISDIR(st.st_mode)){found=1;break;}
+ }
+ if(!found)return 0;
+ /* The save must share its basename with the ROM for game-specific loading. */
+ const char *base=strrchr(files[selected],'/');base=base?base+1:files[selected];
+ char stem[300];snprintf(stem,sizeof(stem),"%s",base);
+ char *dot=strrchr(stem,'.');if(dot)*dot=0;
+ if(strchr(stem,'/')||strchr(stem,'\\')||!stem[0])return 0;
+ snprintf(dst,sizeof(dst),"%s/%s.cht",sub,stem);
+ /* Existing per-game cheats might contain other valuable codes: never replace. */
+ int fd=open(dst,O_WRONLY|O_CREAT|O_EXCL,0644);
+ if(fd<0)return 0;
+ FILE *f=fdopen(fd,"w");if(!f){close(fd);unlink(dst);return 0;}
+ fprintf(f,"cheats = 1\n");
+ fprintf(f,"cheat0_desc = \"Pokemon Editor wild encounter Dex %d Lv %d\"\n",enc_dex,enc_level);
+ fprintf(f,"cheat0_enable = true\n");
+ fprintf(f,"cheat0_handler = 1\n");
+ fprintf(f,"cheat0_code = \"83007CEE %04X+33007CF0 %04X\"\n",sid,enc_level);
+ int ok=!ferror(f);if(fclose(f))ok=0;
+ if(!ok)unlink(dst);
+ return ok;
+}
 static int save_in_place(void){
- if(save_game!=1)return 0;
+ if(save_game<1)return 0;
  if(!dirty)return 1;
  if(active<0)return 0;
  int outidx[14];uint32_t counter;
  if(!valid_slot(active,outidx,&counter))return 0;
+ /* Refuse to overwrite a save changed by RetroArch since opening. */
+ FILE *verify=fopen(files[selected],"rb");if(!verify)return 0;
+ uint8_t checkbuf[8192];int identical=1;
+ for(size_t i=0;i<SAVE_SIZE;i+=sizeof(checkbuf)){
+  if(fread(checkbuf,1,sizeof(checkbuf),verify)!=sizeof(checkbuf)||
+     memcmp(checkbuf,snapshot+i,sizeof(checkbuf))) {identical=0;break;}
+ }
+ fclose(verify);if(!identical)return 0;
  if(!backup())return 0;
  char temp[600];int n=snprintf(temp,sizeof(temp),"%s.tmp.%ld",files[selected],(long)getpid());
  if(n<=0||n>=(int)sizeof(temp))return 0;
@@ -474,7 +685,7 @@ static int save_in_place(void){
  if(close(fd))ok=0;
  if(!ok){unlink(temp);return 0;}
  if(rename(temp,files[selected])){unlink(temp);return 0;}
- dirty=0;return 1;
+ memcpy(snapshot,data,SAVE_SIZE);dirty=0;return 1;
 }
 
 static int save_box_copy(void){
@@ -537,6 +748,50 @@ static void parent_folder(void){
  list_directories();
 }
 
+/* Offline PK3 imports: only valid boxed records (80 bytes) and
+   party records (100 bytes). No claim that a file represents a real event. */
+#define MAX_PK3 128
+static char pk3_files[MAX_PK3][512];static int pk3_count=0;
+static void scan_pk3_dir(const char *dir,int depth){
+ if(depth>5||pk3_count>=MAX_PK3)return;
+ DIR *d=opendir(dir);if(!d)return;struct dirent *e;
+ while((e=readdir(d))&&pk3_count<MAX_PK3){
+  if(e->d_name[0]=='.')continue;
+  char full[512];int n=snprintf(full,sizeof(full),"%s/%s",dir,e->d_name);
+  if(n<=0||n>=512)continue;
+  struct stat st;if(lstat(full,&st)||S_ISLNK(st.st_mode))continue;
+  if(S_ISDIR(st.st_mode))scan_pk3_dir(full,depth+1);
+  if(S_ISREG(st.st_mode)&&(st.st_size==80||st.st_size==100)){
+   size_t z=strlen(full);
+   if(z>=4&&!strcasecmp(full+z-4,".pk3"))snprintf(pk3_files[pk3_count++],512,"%s",full);
+  }
+ }
+ closedir(d);
+}
+static void scan_pk3(void){
+ pk3_count=0;import_cursor=0;
+ const char *roots[]={"/run/muos/storage/application/PokemonSaveBrowser/events",
+  "/run/muos/storage/application/PokemonEditor/events",
+  "/mnt/mmc/PokemonEvents","/mnt/sdcard/PokemonEvents",
+  "/run/muos/storage/roms/PokemonEvents"};
+ for(size_t i=0;i<sizeof(roots)/sizeof(roots[0]);i++)scan_pk3_dir(roots[i],0);
+}
+static int import_pk3(void){
+ if(!pk3_count||import_cursor>=pk3_count||save_game<1)return 0;
+ uint8_t mon[80];FILE *f=fopen(pk3_files[import_cursor],"rb");if(!f)return 0;
+ int ok=fread(mon,1,80,f)==80;fclose(f);
+ if(!ok||!validate_box_mon(mon))return 0;
+ int sp=(int)((rd32(mon+32+growth_pos(rd32(mon)%24)*12)^(rd32(mon)^rd32(mon+4)))&65535);
+ if(sp<1||sp>411)return 0;
+ for(int b=0;b<14;b++)for(int i=0;i<30;i++){
+  uint8_t target[80];if(!box_read(b,i,target))return 0;
+  if(rd32(target)==0&&rd32(target+4)==0){
+   if(!storage_write(4+(b*30+i)*80,mon,80))return 0;
+   recompute_pc();dirty=1;return 1;
+  }
+ }
+ return 0;
+}
 static const char *abc=" ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.-_/:";
 static const unsigned char glyph[][7]={
  {0,0,0,0,0,0,0},{14,17,31,17,17,17,0},{30,17,30,17,17,30,0},
@@ -589,10 +844,10 @@ static void panel(SDL_Renderer *r,int x,int y,int w,int h){
  fill(r,x,y,w,h,24,38,58);fill(r,x,y,w,2,64,117,130);
 }
 static void tabline(SDL_Renderer *r){
- const char *names[]={"BAG","PC","EGGS","EVENTS","HEALTH"};
- for(int i=0;i<5;i++){
-  if(tab==i)fill(r,6+i*126,67,123,37,36,98,116);
-  label(r,13+i*126,79,names[i],2);
+ const char *names[]={"BAG","PC","EGGS","EVENTS","ENCOUNTR","HEALTH"};
+ for(int i=0;i<6;i++){
+  if(tab==i)fill(r,5+i*105,67,103,37,36,98,116);
+  label(r,10+i*105,79,names[i],2);
  }
 }
 int main(void){
@@ -655,22 +910,22 @@ int main(void){
     if(b==SDL_CONTROLLER_BUTTON_START){count=0;selected=0;for(int i=0;i<ROOT_COUNT;i++)scan(root_paths[i],0);status=0;}
     if(b==SDL_CONTROLLER_BUTTON_X){folder_view=1;list_directories();status=0;}
     if(b==SDL_CONTROLLER_BUTTON_A&&count){
-     if(load(files[selected])){detail=1;tab=0;status=0;bag_index=0;bag_qty=50;catalog_game=0;event_index=0;box_num=0;box_slot=0;edit_field=0;}
+     if(load(files[selected])){detail=1;tab=0;status=0;bag_index=0;bag_qty=50;catalog_game=(save_game==1?0:save_game==4?2:1);event_index=0;bag_raw_mode=0;creator_dex=151;box_num=0;box_slot=0;edit_field=0;}
      else status=3;
     }
     continue;
    }
-   if(b==SDL_CONTROLLER_BUTTON_Y){confirming=dirty&&save_game==1;status=save_game!=1?15:dirty?0:8;continue;}
+   if(b==SDL_CONTROLLER_BUTTON_Y){confirming=dirty&&save_game>0;status=save_game==0?15:dirty?0:8;continue;}
    if(b==SDL_CONTROLLER_BUTTON_B){if(dirty){status=14;}else{detail=0;status=0;}continue;}
-   if(b==SDL_CONTROLLER_BUTTON_LEFTSHOULDER){tab=(tab+4)%5;status=0;continue;}
-   if(b==SDL_CONTROLLER_BUTTON_RIGHTSHOULDER){tab=(tab+1)%5;status=0;continue;}
-   if(save_game!=1 && tab!=4){status=15;continue;}
+   if(b==SDL_CONTROLLER_BUTTON_LEFTSHOULDER){tab=(tab+5)%6;status=0;continue;}
+   if(b==SDL_CONTROLLER_BUTTON_RIGHTSHOULDER){tab=(tab+1)%6;status=0;continue;}
+   if(save_game==0 && tab!=5){status=15;continue;}
    if(tab==0){
-    if(b==SDL_CONTROLLER_BUTTON_DPAD_DOWN)bag_index=(bag_index+1)%bag_choice_count();
-    if(b==SDL_CONTROLLER_BUTTON_DPAD_UP)bag_index=(bag_index+bag_choice_count()-1)%bag_choice_count();
-    if(b==SDL_CONTROLLER_BUTTON_START){catalog_game=(catalog_game+1)%3;bag_index=0;}
+    if(b==SDL_CONTROLLER_BUTTON_DPAD_DOWN)bag_index=(bag_index+1)%(bag_raw_mode?575:bag_choice_count());
+    if(b==SDL_CONTROLLER_BUTTON_DPAD_UP)bag_index=(bag_index+(bag_raw_mode?575:bag_choice_count())-1)%(bag_raw_mode?575:bag_choice_count());
+    if(b==SDL_CONTROLLER_BUTTON_START){bag_raw_mode=!bag_raw_mode;bag_index=0;}
     if(b==SDL_CONTROLLER_BUTTON_DPAD_LEFT&&bag_qty>1)bag_qty--;
-    if(b==SDL_CONTROLLER_BUTTON_DPAD_RIGHT&&bag_qty<99)bag_qty++;
+    if(b==SDL_CONTROLLER_BUTTON_DPAD_RIGHT&&bag_qty<999)bag_qty++;
     if(b==SDL_CONTROLLER_BUTTON_A){
      if(add_bag_item(bag_index,bag_qty)){dirty=1;status=10;}else status=5;
     }
@@ -692,19 +947,43 @@ int main(void){
     if(b==SDL_CONTROLLER_BUTTON_X)odds_index=(odds_index+1)%8;
     if(b==SDL_CONTROLLER_BUTTON_A)status=egg_create()?11:5;
    }else if(tab==3){
-    if(b==SDL_CONTROLLER_BUTTON_DPAD_DOWN)event_index=(event_index+1)%EVENT_COUNT;
-    if(b==SDL_CONTROLLER_BUTTON_DPAD_UP)event_index=(event_index+EVENT_COUNT-1)%EVENT_COUNT;
-    if(b==SDL_CONTROLLER_BUTTON_START)box_num=(box_num+1)%14;
-    if(b==SDL_CONTROLLER_BUTTON_DPAD_RIGHT)box_slot=(box_slot+1)%30;
-    if(b==SDL_CONTROLLER_BUTTON_DPAD_LEFT)box_slot=(box_slot+29)%30;
-    if(b==SDL_CONTROLLER_BUTTON_A)status=event_spawn()?13:5;
+    if(b==SDL_CONTROLLER_BUTTON_START){creator_mode=(creator_mode+1)%3;if(creator_mode==2)scan_pk3();}
+    else if(creator_mode==0){
+     if(b==SDL_CONTROLLER_BUTTON_DPAD_DOWN)creator_field=(creator_field+1)%12;
+     if(b==SDL_CONTROLLER_BUTTON_DPAD_UP)creator_field=(creator_field+11)%12;
+     if(b==SDL_CONTROLLER_BUTTON_DPAD_LEFT)creator_change(creator_field,-1);
+     if(b==SDL_CONTROLLER_BUTTON_DPAD_RIGHT)creator_change(creator_field,1);
+     if(b==SDL_CONTROLLER_BUTTON_X)creator_shiny=!creator_shiny;
+     if(b==SDL_CONTROLLER_BUTTON_A)status=creator_generate(creator_dex,0)?13:5;
+    }else if(creator_mode==1){
+     if(b==SDL_CONTROLLER_BUTTON_DPAD_DOWN)event_index=(event_index+1)%EVENT_COUNT;
+     if(b==SDL_CONTROLLER_BUTTON_DPAD_UP)event_index=(event_index+EVENT_COUNT-1)%EVENT_COUNT;
+     if(b==SDL_CONTROLLER_BUTTON_A)status=event_spawn()?13:5;
+    }else{
+     if(b==SDL_CONTROLLER_BUTTON_DPAD_DOWN&&import_cursor<pk3_count-1)import_cursor++;
+     if(b==SDL_CONTROLLER_BUTTON_DPAD_UP&&import_cursor>0)import_cursor--;
+     if(b==SDL_CONTROLLER_BUTTON_A)status=import_pk3()?13:5;
+    }
    }else if(tab==4){
+    if(b==SDL_CONTROLLER_BUTTON_DPAD_DOWN)enc_field=(enc_field+1)%2;
+    if(b==SDL_CONTROLLER_BUTTON_DPAD_UP)enc_field=(enc_field+1)%2;
+    if(b==SDL_CONTROLLER_BUTTON_DPAD_LEFT){
+     if(enc_field==0&&enc_dex>1)enc_dex--;
+     if(enc_field==1&&enc_level>1)enc_level--;
+    }
+    if(b==SDL_CONTROLLER_BUTTON_DPAD_RIGHT){
+     if(enc_field==0&&enc_dex<386)enc_dex++;
+     if(enc_field==1&&enc_level<99)enc_level++;
+    }
+    if(b==SDL_CONTROLLER_BUTTON_START)enc_dex=(enc_dex==151?385:151);
+    if(b==SDL_CONTROLLER_BUTTON_A)status=export_encounter()?16:17;
+   }else if(tab==5){
     if(b==SDL_CONTROLLER_BUTTON_A)status=backup()?1:2;
    }
   }
   SDL_SetRenderDrawColor(r,12,21,35,255);SDL_RenderClear(r);
   fill(r,0,0,640,58,20,67,80);
-  label(r,17,17,"POKEMON EDITOR V0.8",3);
+  label(r,17,17,"POKEMON EDITOR V1.0 TEST",3);
   if(folder_view){
    label(r,20,72,"CHOOSE RETROARCH SAVE FOLDER",2);
    panel(r,10,104,620,294);
@@ -725,20 +1004,36 @@ int main(void){
     const char *name=strrchr(files[i],'/');label(r,17,y,name?name+1:files[i],2);
    }
    label(r,18,413,"A OPEN  X FOLDERS  START RESCAN",2);
-   label(r,18,440,"R S WRITE  FR LG READ ONLY",2);
+   label(r,18,440,"R S E FR LG - BACK UP FIRST",2);
   }else{
    tabline(r);
-   if(tab==4){
+   if(tab==5){
     panel(r,12,116,616,283);
     const char *games[]={"UNIDENTIFIED","RUBY SAPPHIRE","FIRERED","LEAFGREEN","EMERALD"};
     label(r,26,139,"SAVE HEALTH CHECK",3);
     label(r,26,183,games[save_game],2);
     label(r,26,215,save_slot_valid[0]?"SLOT A CHECKSUM: VALID":"SLOT A CHECKSUM: BAD",2);
     label(r,26,245,save_slot_valid[1]?"SLOT B CHECKSUM: VALID":"SLOT B CHECKSUM: BAD",2);
-    label(r,26,275,save_game==1?"RUBY SAPPHIRE EDIT MODE":"READ ONLY - EDITING DISABLED",2);
+    label(r,26,275,save_game>0?"EDIT MODE - BACK UP BEFORE SAVING":"READ ONLY - EDITING DISABLED",2);
     label(r,26,316,dirty?"UNSAVED MODIFICATIONS":"NO UNSAVED CHANGES",2);
     label(r,26,357,"A MAKE NUMBERED BACKUP",2);
-   }else if(save_game!=1){
+   }else if(tab==4){
+    panel(r,12,116,616,304);
+    label(r,27,137,"WILD ENCOUNTER GENERATOR",3);
+    label(r,27,185,"FIRERED / LEAFGREEN",2);
+    if(save_game==2||save_game==3){
+     if(enc_field==0)fill(r,20,215,595,30,38,97,119);
+     number(r,29,222,"NATIONAL DEX: %d",enc_dex);
+     if(enc_field==1)fill(r,20,255,595,30,38,97,119);
+     number(r,29,264,"ENCOUNTER LEVEL: %d",enc_level);
+     label(r,27,315,"A INSTALL GAME CHEAT FILE",2);
+     label(r,27,346,"UP DOWN FIELD  LEFT RIGHT VALUE",2);
+     label(r,27,378,"SET RETROARCH AUTO APPLY ONCE",2);
+    }else{
+     label(r,27,227,"GAME NOT YET SUPPORTED",2);
+     label(r,27,284,"NO CODES EXPORTED FOR THIS SAVE",2);
+    }
+   }else if(save_game==0){
     panel(r,12,116,616,280);
     label(r,26,150,"SAVE OPENED - READ ONLY",3);
     label(r,26,213,"GAME EDITING NOT YET VALIDATED",2);
@@ -747,24 +1042,42 @@ int main(void){
    }else if(tab==0){
     panel(r,12,116,616,274);
     label(r,26,138,"BAG STORAGE",3);
-    label(r,26,177,catalog_names[catalog_game],2);
-    label(r,26,218,bag_choice()->name,3);
+    label(r,26,177,bag_raw_mode?"ALL ITEM IDS - EXPERT MODE":catalog_names[catalog_game],2);
+    if(bag_raw_mode)number(r,26,218,"ITEM ID: %d",bag_index+1);
+    else label(r,26,218,bag_choice()->name,3);
     number(r,460,170,"ITEM %d",bag_index+1);
-    number(r,460,197,"OF %d",bag_choice_count());
+    number(r,460,197,"OF %d",bag_raw_mode?575:bag_choice_count());
     number(r,26,275,"ADD AMOUNT: %d",bag_qty);
-    label(r,26,329,"START GAME  UP DOWN ITEM",2);
-    if(catalog_game==0)label(r,26,352,"A ADD TO BAG - RUBY SAPPHIRE",2);
-    else label(r,26,352,"CATALOG ONLY - DO NOT WRITE",2);
-    if(bag_choice()->offset==0x5b0)label(r,26,375,"KEY ITEM QUANTITY ONE",2);
+    label(r,26,329,"START CATALOG RAW IDS  UP DOWN",2);
+    label(r,26,352,"A ADD ITEM TO SELECTED GAME",2);
+    label(r,26,375,"RAW IDS MAY BE INVALID IN GAME",2);
    }else if(tab==3){
-    panel(r,12,115,616,275);
-    label(r,24,138,"EVENT POKEMON GENERATOR",3);
-    label(r,24,193,event_pokemon[event_index].name,3);
-    number(r,24,241,"INTERNAL SPECIES: %d",event_pokemon[event_index].species);
-    number(r,24,280,"TEMPLATE BOX %d",box_num+1);
-    number(r,320,280,"SLOT %d",box_slot+1);
-    label(r,24,324,"A SPAWN FROM PC TEMPLATE",2);
-    label(r,24,354,"CUSTOM TEMPLATE NOT AUTHENTIC",2);
+    panel(r,12,115,616,306);
+    label(r,24,135,creator_mode==0?"NEW POKEMON":creator_mode==1?"EVENT RECREATIONS":"IMPORT ARCHIVED PK3",3);
+    if(creator_mode==2){
+     number(r,24,196,"PK3 FILES FOUND: %d",pk3_count);
+     if(pk3_count){const char *fn=strrchr(pk3_files[import_cursor],'/');
+      label(r,24,233,fn?fn+1:pk3_files[import_cursor],2);}
+     else label(r,24,233,"PLACE PK3 IN POKEMONEVENTS",2);
+     label(r,24,315,"UP DOWN SELECT  A IMPORT",2);
+    }else if(creator_mode==1){
+     label(r,24,190,event_pokemon[event_index].name,3);
+     number(r,24,241,"NATIONAL DEX: %d",event_pokemon[event_index].dex);
+     label(r,24,287,"RECONSTRUCTED - NOT ORIGINAL",2);
+     label(r,24,327,"UP DOWN EVENT   A CREATE",2);
+    }else{
+     const char *names[]={"SPECIES DEX","APPROX LEVEL","NATURE","ABILITY SLOT","HELD ITEM","MOVE 1","MOVE 2","MOVE 3","MOVE 4","ALL IVS","ALL EVS","SHINY"};
+     int vals[]={creator_dex,creator_level,creator_nature,creator_ability,creator_item,creator_moves[0],creator_moves[1],creator_moves[2],creator_moves[3],creator_iv,creator_ev,creator_shiny};
+     int first=creator_field>=6?6:0;
+     for(int j=first;j<first+6;j++){
+      int y=177+(j-first)*34;
+      if(j==creator_field)fill(r,18,y-5,600,29,40,96,118);
+      label(r,28,y,names[j],2);
+      number(r,390,y,"%d",vals[j]);
+     }
+     label(r,24,393,"UP DOWN FIELD  LEFT RIGHT VALUE",2);
+    }
+    label(r,16,431,"A CREATE / IMPORT   START MODE",2);
    }else{
     panel(r,10,114,620,272);
     number(r,23,123,"BOX %d / 14",box_num+1);
@@ -785,8 +1098,9 @@ int main(void){
      label(r,14,413,egg_odds_label[odds_index],2);
     }
    }
-   if(tab==4)label(r,16,441,"A BACKUP   L R TABS",2);
-   else if(tab==3)label(r,16,441,"A SPAWN  START BOX  L R TABS",2);
+   if(tab==5)label(r,16,441,"A BACKUP   L R TABS",2);
+   else if(tab==4)label(r,16,441,"A EXPORT .TXT   L R TABS",2);
+   else if(tab==3)label(r,16,451,"X SHINY IN CREATOR",2);
    else if(tab==2)label(r,16,441,"A MAKE EGG  X ODDS  START BOX",2);
    else label(r,16,441,"Y SAVE  L R TABS  START BOX",2);
   }
@@ -805,8 +1119,8 @@ int main(void){
    label(r,55,280,"A YES    B CANCEL",2);
   }
   if(status){
-   const char *msgs[]={"","BACKUP CREATED","BACKUP FAILED","INVALID SAVE","SAVED TO GAME FILE","OPERATION FAILED","FOLDER FOUND","FOLDER EMPTY","NOTHING TO SAVE","UNSAVED CHANGES LOST","CHANGE STAGED","EGG ADDED TO PC","POKEMON DELETED","EVENT MON STAGED","SAVE OR RELOAD BEFORE EXIT","READ ONLY SAVE"};
-   if(status>=1&&status<=15){fill(r,6,456,628,23,23,57,68);label(r,13,460,msgs[status],2);}
+   const char *msgs[]={"","BACKUP CREATED","BACKUP FAILED","INVALID SAVE","SAVED TO GAME FILE","OPERATION FAILED","FOLDER FOUND","FOLDER EMPTY","NOTHING TO SAVE","UNSAVED CHANGES LOST","CHANGE STAGED","EGG ADDED TO PC","POKEMON DELETED","EVENT MON STAGED","SAVE OR RELOAD BEFORE EXIT","READ ONLY SAVE","GAME CHEAT FILE INSTALLED","NO MATCHING CHEAT DIR OR FILE EXISTS"};
+   if(status>=1&&status<=17){fill(r,6,456,628,23,23,57,68);label(r,13,460,msgs[status],2);}
   }else if(detail&&!confirming)label(r,520,460,dirty?"UNSAVED":"CLEAN",2);
   SDL_RenderPresent(r);SDL_Delay(16);
  }
