@@ -1,19 +1,13 @@
-# Pokémon Editor v0.8 — save safety and UI groundwork
+# Pokémon Editor v1.0 — automatic cheat-file installer (experimental)
 
-This is a **development source package**, not a tested `.muxapp`.
+The Encounter tab now attempts to write a game-named `.cht` file directly into the existing RetroArch cheats directory, using the mGBA/gpSP core subdirectory if found. **This is not verified as fully automatic gameplay activation.**
 
-### Changes from v0.7
-- Save Health Check tab: validity of both checksum slots, game label, dirty status, create a numbered backup.
-- FireRed / LeafGreen / Emerald save files can be opened for checksum inspection **read-only**; editing remains locked.
-- Ruby/Sapphire edits are restricted to explicitly recognised filenames, not arbitrary unknown saves.
-- Prevent backing out of a file while there are unsaved edits (save first; to discard restart without saving).
-- Five-tab layout, clear read-only warning, adjusted navigation and safe backup controls.
+- FireRed/LeafGreen only; game codes may not match Rev 1/v1.1.
+- A in ENCOUNTR installs the `.cht`, but never overwrites an existing cheat file. If none of the expected core subdirectories exist, it reports failure.
+- In RetroArch, the user must enable `Quick Menu > Cheats > Auto-Apply Cheats During Game Load` once, and save the setting for the game.
+- The save filename must match the ROM filename (before `.srm`/`.gba`).
+- Do not leave encounter cheats enabled after catching the target.
+- No ROM patches or NPC events. Normal shiny odds unchanged.
+- This source has only been syntax checked; not ARM64 built or tested on an Anbernic.
 
-### Not yet shipped
-- Functional NPC-triggered encounters / ROM modification / ACE (unsafe to claim with a save editor).
-- Authentic sprite images in the compiled build: the image preview is a **concept mockup**, not the current UI.
-- Full event database / `.pk3` import / general 386-species editor / validated FireRed and LeafGreen writes.
-- Reliable confirmation for every game in emulator or on hardware.
-
-### Building
-Replace `src/main.c` in your GitHub repository; run existing Actions build. This is NOT verified on real SDL2 ARM64 hardware. Keep separate copies of every save.
+Replace `src/main.c` in the existing repository, run GitHub Actions and send the compiled artifact for .muxapp packaging.
