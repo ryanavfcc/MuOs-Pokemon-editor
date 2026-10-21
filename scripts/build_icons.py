@@ -6,7 +6,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from io import BytesIO
 from pathlib import Path
 from urllib.request import Request, urlopen
-from PIL import Image
+from PIL import Image, ImageDraw
+import re, csv, hashlib
 import time
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -27,19 +28,43 @@ def get_icon(dex):
             for red,green,blue,alpha in image.getdata():
                 # Opaque bit + RGB 5:5:5, 0 reserved for transparent.
                 pixels.append(0 if alpha<96 else 0x8000 | ((red>>3)<<10) | ((green>>3)<<5) | (blue>>3))
-            return dex,pixels
+            return dex,pixels,data
         except Exception:
             if attempt==3: raise
             time.sleep(1.5*(attempt+1))
 
 if __name__ == '__main__':
     icons=[None]*386
+    originals=[None]*386
+    hashes=[None]*386
     with ThreadPoolExecutor(max_workers=12) as pool:
         tasks={pool.submit(get_icon,dex):dex for dex in range(1,387)}
         for job in as_completed(tasks):
-            dex,pixels=job.result()
+            dex,pixels,data=job.result()
             icons[dex-1]=pixels
+            originals[dex-1]=Image.open(BytesIO(data)).convert("RGBA")
+            hashes[dex-1]=hashlib.sha256(data).hexdigest()
     assert all(len(i)==W*H for i in icons)
+    assert all(im is not None and im.getbbox() is not None for im in originals), "Missing/blank icon"
+    name_header=(ROOT/'src/pokemon_names_data.h').read_text()
+    names=re.findall(r'^"([^"\n]+)",$', name_header, re.MULTILINE)
+    assert len(names)==387, f"Expected 387 names including index zero, got {len(names)}"
+    with (ROOT/'sprite-index.csv').open('w',newline='') as fp:
+        writer=csv.writer(fp);writer.writerow(['national_dex','pokemon_name','png_sha256','sprite_source'])
+        for dex in range(1,387):
+            writer.writerow([dex,names[dex],hashes[dex],f'{BASE}/{dex}.png'])
+    # A review sheet of *every* species is part of the GitHub artifact.
+    # This deliberately uses National Dex numbers, not Gen 3 internal IDs.
+    cols=12;rows=(386+cols-1)//cols
+    sheet=Image.new("RGB",(cols*92,rows*56),(20,28,43))
+    draw=ImageDraw.Draw(sheet)
+    for dex,im in enumerate(originals,1):
+        x=((dex-1)%cols)*92;y=((dex-1)//cols)*56
+        sheet.paste(im,(x+25,y+2),im)
+        draw.text((x+5,y+37),f"{dex:03d} {names[dex][:11]}",fill=(230,240,248))
+    review=ROOT/'sprite-review-all-386.png'
+    sheet.save(review)
+    print(f"Sprite review sheet: {review}")
     with OUT.open('w',encoding='ascii') as f:
         f.write('/* AUTO GENERATED from PokeAPI/sprites, pixel box icons (Gen VII). */\n')
         f.write('#ifndef POKEMON_ICON_DATA_H\n#define POKEMON_ICON_DATA_H\n')
