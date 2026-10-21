@@ -1,5 +1,4 @@
-
-name: Build ARM64 muOS prototype
+name: Build ARM64 muOS editor with sprites
 
 on:
   workflow_dispatch:
@@ -9,19 +8,29 @@ on:
 jobs:
   build:
     runs-on: ubuntu-24.04-arm
-
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout project
+        uses: actions/checkout@v4
 
-      - name: Install SDL2
+      - name: Install compiler, SDL2 and Python dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential libsdl2-dev zip
+          sudo apt-get install -y build-essential libsdl2-dev pkg-config zip python3 python3-pil
 
-      - name: Compile ARM64
-        run: make
+      - name: Generate 386 mini sprites and Pokemon names
+        run: |
+          python3 scripts/build_icons.py
+          python3 scripts/build_names.py
+          test -s src/pokemon_icon_data.h
+          test -s src/pokemon_names_data.h
 
-      - name: Package executable
+      - name: Compile ARM64 editor
+        run: |
+          make clean
+          make
+          file pokemon-browser
+
+      - name: Package application executable
         run: |
           mkdir -p dist/PokemonBrowser
           cp pokemon-browser launch.sh dist/PokemonBrowser/
@@ -29,8 +38,8 @@ jobs:
           cd dist
           zip -r ../pokemon-browser-arm64.zip PokemonBrowser
 
-      - uses: actions/upload-artifact@v4
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
         with:
           name: pokemon-browser-arm64
           path: pokemon-browser-arm64.zip
-
