@@ -6,31 +6,23 @@
 #include <string.h>
 #include <dirent.h>
 #include <sys/stat.h>
-#include <strings.h>
-#include <sys/types.h>
 #define MAX 200
 static char paths[MAX][512];
 static int nfiles=0;
-static int is_save(const char *p, off_t size) {
- size_t z=strlen(p);
- if(z<4 || (strcasecmp(p+z-4,".sav") && strcasecmp(p+z-4,".srm")))return 0;
- /* Gen 3 GBA save is typically 128 KiB; accept smaller/expanded
-    RetroArch containers for discovery, but do not edit them. */
- return size>=32768 && size<=262144;
-}
 static void search(const char *dir,int depth){
- if(depth>12||nfiles>=MAX)return;
+ if(depth>5||nfiles>=MAX)return;
  DIR *d=opendir(dir);if(!d)return;
  struct dirent *e;
  while((e=readdir(d)) && nfiles<MAX){
-  if(!strcmp(e->d_name,".")||!strcmp(e->d_name,".."))continue;
+  if(e->d_name[0]=='.')continue;
   char p[512];int k=snprintf(p,sizeof(p),"%s/%s",dir,e->d_name);
   if(k<0||k>=(int)sizeof(p))continue;
-  struct stat st;if(lstat(p,&st))continue;
-  if(S_ISLNK(st.st_mode))continue;
+  struct stat st;if(stat(p,&st))continue;
   if(S_ISDIR(st.st_mode))search(p,depth+1);
-  else if(S_ISREG(st.st_mode)&&is_save(p,st.st_size))
-    snprintf(paths[nfiles++],512,"%s",p);
+  else if(S_ISREG(st.st_mode)&&st.st_size==131072){
+   size_t z=strlen(p);
+   if(z>=4 && (!strcasecmp(p+z-4,".sav")))snprintf(paths[nfiles++],512,"%s",p);
+  }
  }
  closedir(d);
 }
@@ -71,14 +63,8 @@ int main(void){
  if(!r){SDL_DestroyWindow(w);SDL_Quit();return 1;}
  SDL_RenderSetLogicalSize(r,640,480);
  for(int i=0;i<SDL_NumJoysticks();i++)if(SDL_IsGameController(i))SDL_GameControllerOpen(i);
- const char *dirs[]={
-  "/run/muos/storage/save", "/run/muos/storage/roms",
-  "/mnt/mmc/SAVES", "/mnt/sdcard/SAVES",
-  "/mnt/mmc/ROMS", "/mnt/sdcard/ROMS",
-  "/mnt/mmc/MUOS/save", "/mnt/sdcard/MUOS/save",
-  "/mnt/mmc/RetroArch/saves", "/mnt/sdcard/RetroArch/saves"
- };
- for(size_t i=0;i<sizeof(dirs)/sizeof(dirs[0]);i++)search(dirs[i],0);
+ const char *dirs[]={"/mnt/mmc/ROMS","/mnt/sdcard/ROMS","/mnt/mmc/SAVES","/mnt/sdcard/SAVES"};
+ for(int i=0;i<4;i++)search(dirs[i],0);
  int selected=0,detail=0,running=1;
  while(running){
   SDL_Event e;
@@ -103,11 +89,11 @@ int main(void){
   if(detail){
    label(r,16,105,"SELECTED FILE",2);
    const char *q=strrchr(paths[selected],'/');label(r,16,160,q?q+1:paths[selected],2);
-   label(r,16,230,"RETROARCH SAVE FOUND",2);
+   label(r,16,230,"128 KB GBA SAVE",2);
    label(r,16,290,"READ ONLY - NO EDITS",2);
    label(r,16,430,"B BACK",2);
   }else{
-   if(!nfiles){label(r,16,140,"NO SAV OR SRM FOUND",2);label(r,16,200,"CHECK YOUR SAVE FOLDERS",2);}
+   if(!nfiles){label(r,16,140,"NO SAV FILES FOUND",2);label(r,16,200,"CHECK YOUR SAVE FOLDERS",2);}
    int first=selected>3?selected-3:0;
    for(int i=first,y=90;i<nfiles&&y<415;i++,y+=40){
     if(i==selected)fill(r,8,y-6,624,36,39,87,105);
