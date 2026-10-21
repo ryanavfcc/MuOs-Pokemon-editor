@@ -19,7 +19,7 @@
 static char files[MAX_FILES][512];
 static int count=0, selected=0, pokemon=0, species=1, detail=0, status=0, bag_index=0, bag_qty=50, tab=0, box_num=0, box_slot=0, box_species=1;
 static uint8_t data[SAVE_SIZE], snapshot[SAVE_SIZE];
-static int dirty=0, confirming=0, odds_index=0, egg_species=1, edit_field=0, pokemon_editor_open=0, folder_view=0, root_index=0;
+static int dirty=0, confirming=0, odds_index=0, egg_species=1, edit_field=0, pokemon_editor_open=0, folder_view=0, root_index=0, party_slot=0, editor_party=0, egg_from_scratch=1;
 static int catalog_game=0, delete_confirm=0, event_index=0, save_game=0, save_slot_valid[2]={0,0}, tool_cursor=0, creator_dex=151, bag_raw_mode=0, import_mode=0, import_cursor=0;
 static char root_custom[512]="";
 static const char *root_paths[]={"/run/muos/storage/save", "/run/muos/storage/roms", "/mnt/mmc/SAVES", "/mnt/sdcard/SAVES", "/mnt/mmc/ROMS", "/mnt/sdcard/ROMS", "/mnt/mmc/RetroArch/saves", "/mnt/sdcard/RetroArch/saves", "/mnt/mmc/MUOS/save", "/mnt/sdcard/MUOS/save", "/mnt/mmc", "/mnt/sdcard"};
@@ -70,12 +70,13 @@ static int load(const char *path){
  active=vb&&(!va||(int32_t)(cb-ca)>0)?1:0;
  memcpy(sec,active?b:a,sizeof(sec));memcpy(snapshot,data,SAVE_SIZE);dirty=0;return 1;
 }
+static int party_offset(void){return (save_game==2||save_game==3)?0x34:0x234;}
 static int party_count(void){
- int n=rd32(data+sec[1]*SECTION_SIZE+0x234);
+ int n=rd32(data+sec[1]*SECTION_SIZE+party_offset());
  return n>=0&&n<=6?n:0;
 }
 static uint8_t *party(int i){
- return data+sec[1]*SECTION_SIZE+0x238+i*100;
+ return data+sec[1]*SECTION_SIZE+party_offset()+4+i*100;
 }
 static const int growth_index[24]={0,0,0,0,0,0,1,1,2,3,2,3,1,1,2,3,2,3,1,1,2,3,2,3};
 /* Growth block offset determined by permutation PID % 24. */
@@ -432,16 +433,43 @@ static int set_mon_shiny(uint8_t mon[80],int want_shiny){
  wr32(mon,pid);encrypt_mon(mon,rearranged);
  return validate_box_mon(mon)&&mon_shiny(mon)==want_shiny;
 }
+/* Shared boxed/party Pokemon field editor. Party records have 100 bytes,
+   with the same first 80 bytes as boxed Pokemon. Party derived stats are
+   retained; changing species may require an in-game recalculation. */
+static int editor_read(uint8_t mon[80]){
+ if(editor_party){
+  if(party_slot>=party_count()||party_slot<0)return 0;
+  memcpy(mon,party(party_slot),80);return 1;
+ }
+ return box_read(box_num,box_slot,mon);
+}
+static int editor_write(const uint8_t mon[80]){
+ if(editor_party){
+  if(party_slot>=party_count()||party_slot<0)return 0;
+  memcpy(party(party_slot),mon,80);recompute_section(1);
+ }else{
+  if(!storage_write(4+(box_num*30+box_slot)*80,mon,80))return 0;
+  recompute_pc();
+ }
+ dirty=1;return 1;
+}
+static int party_species_id(int slot){
+ if(slot<0||slot>=party_count())return 0;
+ uint8_t mon[80];memcpy(mon,party(slot),80);
+ if(!validate_box_mon(mon))return 0;
+ uint32_t key=rd32(mon)^rd32(mon+4);
+ int pos=growth_pos(rd32(mon)%24);
+ return (uint16_t)((rd32(mon+32+pos*12)^key)&65535);
+}
 static int box_current_shiny(void){
  uint8_t mon[80];
- return box_read(box_num,box_slot,mon)&&validate_box_mon(mon)?mon_shiny(mon):-1;
+ return editor_read(mon)&&validate_box_mon(mon)?mon_shiny(mon):-1;
 }
 static int box_edit_shiny(void){
  uint8_t mon[80];
- if(!box_read(box_num,box_slot,mon)||!validate_box_mon(mon))return 0;
+ if(!editor_read(mon)||!validate_box_mon(mon))return 0;
  if(!set_mon_shiny(mon,!mon_shiny(mon)))return 0;
- if(!storage_write(4+(box_num*30+box_slot)*80,mon,80))return 0;
- recompute_pc();dirty=1;return 1;
+ return editor_write(mon);
 }
 
 static int box_field_value(int field){
@@ -472,7 +500,7 @@ static int editor_block(uint32_t pid,char type){
 }
 static int box_detail_value(int field){
  uint8_t mon[80],plain[48];
- if(!box_read(box_num,box_slot,mon)||!validate_box_mon(mon))return -1;
+ if(!editor_read(mon)||!validate_box_mon(mon))return -1;
  if(field==3)return mon_shiny(mon);
  if(field==21)return 1;
  decrypt_mon(mon,plain);
@@ -492,7 +520,7 @@ static int box_detail_adjust(int field,int delta){
  if(field==3)return box_edit_shiny();
  if(field==21)return 0;
  uint8_t mon[80],plain[48];
- if(!box_read(box_num,box_slot,mon)||!validate_box_mon(mon))return 0;
+ if(!editor_read(mon)||!validate_box_mon(mon))return 0;
  decrypt_mon(mon,plain);
  int g=editor_block(rd32(mon),'G'),a=editor_block(rd32(mon),'A');
  int e=editor_block(rd32(mon),'E'),m=editor_block(rd32(mon),'M');
@@ -518,8 +546,7 @@ static int box_detail_adjust(int field,int delta){
  else if(field==20){uint32_t bits=rd32(plain+m+4);bits=(bits&0x7fffffffu)|((uint32_t)next<<31);wr32(plain+m+4,bits);}
  encrypt_mon(mon,plain);
  if(!validate_box_mon(mon))return 0;
- if(!storage_write(4+(box_num*30+box_slot)*80,mon,80))return 0;
- recompute_pc();dirty=1;return 1;
+ return editor_write(mon);
 }
 
 /* Generate a believable egg from an existing boxed Pokemon, retaining
@@ -582,7 +609,7 @@ static int egg_create(void){
 /* PC deletion: replace an occupied, checksum-valid Pokemon with a blank
    80-byte record, preserving every other record and section. */
 static int box_delete(void){
- if(save_game<1)return 0;
+ if(save_game<1||editor_party)return 0;
  uint8_t mon[80],empty[80]={0};
  if(!box_read(box_num,box_slot,mon)||!validate_box_mon(mon))return 0;
  if(!storage_write(4+(box_num*30+box_slot)*80,empty,80))return 0;
@@ -635,7 +662,7 @@ static void gba_name(uint8_t *dst,int cap,const char *name){
   else break;
  }
 }
-static int creator_generate(int dex,int reconstructed){
+static int creator_generate_internal(int dex,int reconstructed,int make_egg){
  if(save_game<1||dex<1||dex>386)return 0;
  int b=-1,s=-1;if(!creator_empty_slot(&b,&s))return 0;
  uint8_t mon[80]={0},plain[48]={0};
@@ -663,7 +690,7 @@ static int creator_generate(int dex,int reconstructed){
  /* A generic, valid nickname is used because species-specific GBA strings
     require a complete localized species-name table. */
  char nick[12];snprintf(nick,sizeof(nick),"PKMN%d",dex);
- gba_name(mon+8,10,nick);gba_name(mon+20,7,"EDITOR");
+ gba_name(mon+8,10,make_egg?"EGG":nick);gba_name(mon+20,7,"EDITOR");
  mon[18]=2; /* English language */
  mon[19]=(uint8_t)(creator_ability?1:0); /* flag bit zero is not ability;
    actual ability selection is encrypted in misc origins bit 31 below */
@@ -675,7 +702,7 @@ static int creator_generate(int dex,int reconstructed){
     approximation; actual level depends on species growth group. */
  uint32_t exp=(uint32_t)creator_level*creator_level*creator_level;
  wr32(plain+growth+4,exp);
- plain[growth+9]=70; /* friendship */
+ plain[growth+9]=(uint8_t)(make_egg?20:70); /* friendship / hatch cycles */
  /* Order GAEM, chosen through PID %24 == 0? PID permutation may vary.
     Reorder logical G/A/E/M into permutation dictated by PID. */
  uint8_t logical[48];memcpy(logical,plain,48);
@@ -685,7 +712,7 @@ static int creator_generate(int dex,int reconstructed){
  for(int i=0;i<6;i++)logical[24+i]=(uint8_t)creator_ev;
  /* IVs packed, 6x 5-bit; personality controls nature. */
  uint32_t iv=0;for(int i=0;i<6;i++)iv|=(uint32_t)creator_iv<<(5*i);
- wr32(logical+40,iv);
+ wr32(logical+40,iv | (make_egg?(1u<<30):0));
  /* Origin info: level at capture and game-of-origin are descriptive only.
     Do not forge a historical event's OT or encounter data. */
  wr16(logical+36,(uint16_t)(creator_level|(save_game==1?1u<<7:4u<<7)));
@@ -706,6 +733,8 @@ static int creator_generate(int dex,int reconstructed){
  (void)reconstructed;
  return 1;
 }
+static int creator_generate(int dex,int reconstructed){return creator_generate_internal(dex,reconstructed,0);}
+static int egg_generate_fresh(void){return creator_generate_internal(egg_species,0,1);}
 static int event_spawn(void){
  /* Preset changes dex, but does NOT claim authentic event data. */
  int dex=event_pokemon[event_index].dex;
@@ -945,32 +974,231 @@ static void pixel_mon(SDL_Renderer *renderer,int x,int y,int species,int scale){
  SDL_Rect target={x,y,MINI_ICON_WIDTH*scale,MINI_ICON_HEIGHT*scale};
  SDL_RenderCopy(renderer,mini_atlas,&source,&target);
 }
-static void panel(SDL_Renderer *r,int x,int y,int w,int h){
- fill(r,x+3,y+4,w,h,7,12,24);
- fill(r,x,y,w,h,25,34,56);
- fill(r,x,y,w,2,74,98,145);
- fill(r,x,y+2,2,h-2,49,67,106);
-}
-static void chip(SDL_Renderer *r,int x,int y,int w,int h,int active){
- fill(r,x+2,y+3,w,h,6,11,21);
- fill(r,x,y,w,h,active?43:28,active?87:45,active?133:72);
- fill(r,x,y,w,2,active?113:58,active?196:77,active?236:111);
-}
-static void titleline(SDL_Renderer *r,int x,int y,const char *s){
- fill(r,x,y+2,5,22,92,195,199);
- label(r,x+15,y,s,3);
-}
-static void tabline(SDL_Renderer *r){
- const char *names[]={"BAG","PC BOX","EGGS","EVENTS","HEALTH"};
- for(int i=0;i<5;i++){
-  int x=8+i*126;
-  chip(r,x,67,120,38,tab==i);
-  label(r,x+9,80,names[i],2);
+static void label_color(SDL_Renderer *r,int x,int y,const char *s,int scale,int rr,int gg,int bb){
+ for(;*s&&x<633-6*scale;s++,x+=6*scale){
+  char c=*s;if(c>='a'&&c<='z')c-=32;
+  const char *q=strchr(abc,c);int idx=q?(int)(q-abc):0;
+  if(idx>=(int)(sizeof(glyph)/sizeof(glyph[0])))idx=0;
+  for(int row=0;row<7;row++)for(int col=0;col<5;col++)
+   if(glyph[idx][row]&(1<<(4-col)))fill(r,x+col*scale,y+row*scale,scale,scale,rr,gg,bb);
  }
 }
+static void muted(SDL_Renderer*r,int x,int y,const char*s,int z){label_color(r,x,y,s,z,148,166,190);}
+static void aqua(SDL_Renderer*r,int x,int y,const char*s,int z){label_color(r,x,y,s,z,99,231,213);}
+static void panel(SDL_Renderer *r,int x,int y,int w,int h){
+ fill(r,x+2,y+3,w,h,7,11,22);
+ fill(r,x,y,w,h,25,36,56);
+ fill(r,x,y,w,2,48,66,91);
+ fill(r,x,y,2,h,48,66,91);
+}
+static void tile(SDL_Renderer*r,int x,int y,int w,int h,int on){
+ fill(r,x,y,w,h,on?35:30,on?72:45,on?88:65);
+ fill(r,x,y,w,2,on?90:46,on?230:69,on?208:91);
+ if(on){fill(r,x,y,3,h,97,228,207);fill(r,x+3,y+h-2,w-3,2,47,122,127);}
+}
+static void head(SDL_Renderer*r,const char*title,const char*sub){
+ label(r,171,16,title,3);muted(r,171,45,sub,2);
+}
+static void dashboard(SDL_Renderer*r){
+ fill(r,0,0,640,480,11,18,31);
+ fill(r,0,0,149,480,17,27,43);
+ fill(r,149,0,2,480,44,64,84);
+ fill(r,0,0,640,4,87,212,193);
+ aqua(r,14,18,"POKEMON",3);
+ label(r,14,48,"EDITOR",3);
+ muted(r,14,80,"MUOS  V1.3",2);
+ const char *names[]={"BAG","PC BOX","PARTY","EGG LAB","EVENTS","HEALTH"};
+ for(int i=0;i<6;i++){
+  int y=125+i*48;
+  tile(r,8,y,133,41,tab==i);
+  if(tab==i)aqua(r,20,y+13,names[i],2);else muted(r,20,y+13,names[i],2);
+ }
+ muted(r,11,438,"L/R TABS",2);
+ fill(r,151,74,489,1,42,63,83);
+}
+static void bottombar(SDL_Renderer*r,const char*msg){
+ fill(r,151,441,489,39,16,27,42);
+ fill(r,151,441,489,1,46,72,93);
+ muted(r,161,451,msg,2);
+}
+static void sectiontitle(SDL_Renderer*r,int x,int y,const char*s){
+ fill(r,x,y+1,4,21,86,224,199);label(r,x+12,y,s,2);
+}
+static void smallspecies(SDL_Renderer*r,int x,int y,int sid){
+ int d=dex_for_internal(sid);
+ if(d>0)pixel_mon(r,x,y,sid,1);
+ else muted(r,x+9,y+9,"--",2);
+}
+static void draw_party(SDL_Renderer*r){
+ head(r,"PARTY EDITOR","EDIT YOUR ACTIVE TEAM");
+ panel(r,163,91,465,334);
+ for(int i=0;i<6;i++){
+  int x=173+(i%2)*226,y=103+(i/2)*101;
+  tile(r,x,y,216,91,i==party_slot);
+  int id=party_species_id(i),dex=dex_for_internal(id);
+  smallspecies(r,x+9,y+12,id);
+  if(dex>0){label(r,x+57,y+14,pokemon_names[dex],2);muted(r,x+57,y+47,"PRESS A TO EDIT",1);}
+  else muted(r,x+57,y+23,"EMPTY SLOT",2);
+  muted(r,x+9,y+70,"PARTY SLOT",1);
+  number(r,x+161,y+70,"%d",i+1);
+ }
+ bottombar(r,"D-PAD SELECT   A EDIT   Y SAVE");
+}
+static void draw_box(SDL_Renderer*r){
+ head(r,"PC STORAGE","CHOOSE A SLOT TO EDIT OR CREATE");
+ panel(r,163,91,465,334);
+ sectiontitle(r,176,104,"POKEMON STORAGE");
+ number(r,517,104,"BOX %d",box_num+1);
+ for(int i=0;i<30;i++){
+  int x=175+(i%6)*74,y=142+(i/6)*47;
+  tile(r,x,y,68,42,i==box_slot);
+  int sid=box_species_id(box_num,i);
+  smallspecies(r,x+3,y+6,sid);
+  if(sid>0){int dex=dex_for_internal(sid);if(dex>0)number(r,x+43,y+26,"%d",dex);}
+ }
+ fill(r,173,384,449,35,18,32,48);
+ int id=box_species_id(box_num,box_slot),dex=dex_for_internal(id);
+ if(dex>0){aqua(r,182,395,pokemon_names[dex],2);muted(r,451,396,"A EDIT POKEMON",1);}
+ else{aqua(r,182,395,"EMPTY SLOT",2);muted(r,451,396,"A CREATE",1);}
+ bottombar(r,"D-PAD SLOT  START NEXT BOX  A OPEN");
+}
+static void draw_bag(SDL_Renderer*r){
+ head(r,"BAG EDITOR","ITEMS, BALLS AND KEY ITEMS");
+ panel(r,163,91,465,334);
+ sectiontitle(r,178,111,"ITEM DIRECTORY");
+ muted(r,180,153,bag_raw_mode?"ALL ITEM IDS":"GAME CATALOGUE",2);
+ tile(r,178,183,436,77,1);
+ if(bag_raw_mode)number(r,192,201,"ITEM ID: %d",bag_index+1);
+ else label(r,192,201,bag_choice()->name,3);
+ muted(r,192,239,catalog_names[catalog_game],1);
+ muted(r,180,283,"QUANTITY TO ADD",2);
+ number(r,475,283,"%d",bag_qty);
+ fill(r,179,320,435,1,49,75,94);
+ muted(r,180,337,"UP/DOWN ITEM   LEFT/RIGHT COUNT",1);
+ muted(r,180,366,"A ADD ITEM   START ALL ITEM IDS",1);
+ bottombar(r,"A ADD ITEM   Y SAVE   L/R TABS");
+}
+static void draw_eggs(SDL_Renderer*r){
+ head(r,"EGG LAB","CREATE EGGS WITHOUT A TEMPLATE");
+ panel(r,163,91,465,334);
+ tile(r,175,104,166,218,1);
+ pixel_mon(r,196,133,dex_to_internal(egg_species),3);
+ aqua(r,187,257,pokemon_names[egg_species],2);
+ muted(r,185,291,"EGG SPECIES",1);
+ sectiontitle(r,355,116,"EGG SETTINGS");
+ muted(r,359,166,"METHOD",2);
+ label(r,359,189,egg_from_scratch?"FROM SCRATCH":"CLONE BOX MON",2);
+ muted(r,359,238,"SHINY ODDS",2);
+ aqua(r,359,266,egg_odds_label[odds_index],2);
+ fill(r,355,311,255,1,51,76,98);
+ muted(r,179,345,"LEFT/RIGHT SPECIES",2);
+ muted(r,179,379,"X ODDS  A CREATE",2);
+ bottombar(r,"A CREATE EGG   X SHINY ODDS");
+}
+static void draw_events(SDL_Renderer*r){
+ head(r,"POKEMON LAB","CREATE, IMPORT OR USE AN EVENT");
+ panel(r,163,91,465,334);
+ const char *modes[]={"CREATE POKEMON","EVENT PRESETS","IMPORT PK3"};
+ for(int i=0;i<3;i++){tile(r,174+i*149,104,141,32,creator_mode==i);muted(r,180+i*149,115,modes[i],1);}
+ if(creator_mode==1){
+  sectiontitle(r,182,163,"HISTORICAL RECREATION");
+  label(r,183,213,event_pokemon[event_index].name,2);
+  pixel_mon(r,485,195,dex_to_internal(event_pokemon[event_index].dex),2);
+  muted(r,183,281,"RECONSTRUCTED NOT ORIGINAL",1);
+  muted(r,183,318,"UP/DOWN EVENT   A GENERATE",2);
+ }else if(creator_mode==2){
+  sectiontitle(r,183,163,"PK3 IMPORT");
+  number(r,183,221,"FILES FOUND: %d",pk3_count);
+  if(pk3_count){const char*fn=strrchr(pk3_files[import_cursor],'/');muted(r,183,269,fn?fn+1:pk3_files[import_cursor],1);}
+  else muted(r,183,269,"NO PK3 FILES FOUND",2);
+  muted(r,183,334,"A IMPORT INTO PC",2);
+ }else{
+  const char *names[]={"SPECIES","LEVEL","NATURE","ABILITY","ITEM","MOVE 1","MOVE 2","MOVE 3","MOVE 4","IV ALL","EV ALL","SHINY"};
+  int vals[]={creator_dex,creator_level,creator_nature,creator_ability,creator_item,creator_moves[0],creator_moves[1],creator_moves[2],creator_moves[3],creator_iv,creator_ev,creator_shiny};
+  int first=creator_field>=6?6:0;
+  for(int j=first;j<first+6;j++){
+   int y=159+(j-first)*39;tile(r,175,y,278,34,j==creator_field);
+   muted(r,187,y+10,names[j],2);number(r,394,y+10,"%d",vals[j]);
+  }
+  tile(r,465,160,150,235,0);
+  pixel_mon(r,480,185,dex_to_internal(creator_dex),2);
+  aqua(r,475,265,pokemon_names[creator_dex],1);
+  muted(r,475,306,creator_shiny?"SHINY":"NORMAL",2);
+  muted(r,475,350,"A CREATE",2);
+ }
+ bottombar(r,"START MODE   D-PAD EDIT   A APPLY");
+}
+static void draw_health(SDL_Renderer*r){
+ head(r,"SAVE HEALTH","CHECK DATA AND BACK UP SAFELY");
+ panel(r,163,91,465,334);
+ const char*games[]={"UNKNOWN","RUBY / SAPPHIRE","FIRERED","LEAFGREEN","EMERALD"};
+ sectiontitle(r,178,111,"GAME DETECTED");
+ aqua(r,183,151,games[save_game],2);
+ tile(r,178,198,436,55,save_slot_valid[0]);
+ label(r,192,216,save_slot_valid[0]?"SAVE SLOT A  VALID":"SAVE SLOT A  INVALID",2);
+ tile(r,178,263,436,55,save_slot_valid[1]);
+ label(r,192,280,save_slot_valid[1]?"SAVE SLOT B  VALID":"SAVE SLOT B  INVALID",2);
+ muted(r,180,344,dirty?"CHANGES WAITING TO SAVE":"NO UNSAVED CHANGES",2);
+ muted(r,180,380,"A CREATE BACKUP",2);
+ bottombar(r,"A BACKUP   Y SAVE CHANGES");
+}
+static void draw_editor(SDL_Renderer*r){
+ fill(r,151,0,489,480,11,18,31);
+ head(r,"EDIT POKEMON","CHANGE DETAILS THEN PRESS Y TO SAVE");
+ panel(r,162,91,188,338);
+ panel(r,359,91,270,338);
+ int dex=box_detail_value(0);
+ if(dex>0&&dex<=386){
+  pixel_mon(r,181,133,dex_to_internal(dex),3);
+  aqua(r,174,262,pokemon_names[dex],2);
+  muted(r,175,298,box_current_shiny()==1?"SHINY":"NORMAL",2);
+ }
+ muted(r,174,350,editor_party?"PARTY POKEMON":"BOX POKEMON",2);
+ muted(r,174,387,"B RETURN",2);
+ const char *groups[]={"IDENTITY / ITEMS","MOVES / STATS","IVS / EVS","OTHER"};
+ int page=edit_field/6;
+ if(page>3)page=3;
+ sectiontitle(r,369,106,groups[page]);
+ int start=page*6,stop=start+6;
+ if(stop>EDITOR_FIELD_COUNT)stop=EDITOR_FIELD_COUNT;
+ for(int i=start;i<stop;i++){
+  int y=148+(i-start)*45;
+  tile(r,369,y,249,39,i==edit_field);
+  muted(r,377,y+7,box_editor_labels[i],1);
+  if(i!=21){
+   int v=box_detail_value(i);
+   if(i==0&&v>0&&v<=386)aqua(r,377,y+22,pokemon_names[v],1);
+   else if(i==3)aqua(r,548,y+19,v?"YES":"NO",2);
+   else number(r,553,y+19,"%d",v);
+  }else muted(r,377,y+23,"PRESS A TO DELETE",1);
+ }
+ bottombar(r,"UP/DOWN FIELD  LEFT/RIGHT EDIT  Y SAVE");
+}
+static void draw_browser(SDL_Renderer*r){
+ dashboard(r);head(r,folder_view?"SAVE FOLDERS":"SELECT A SAVE",folder_view?"PICK A RETROARCH DIRECTORY":"OPEN A GAME SAVE TO BEGIN");
+ panel(r,164,91,464,335);
+ if(folder_view){
+  const char*cp=strrchr(current_path,'/');aqua(r,176,108,cp&&cp[1]?cp+1:current_path,2);
+  int first=directory_cursor>7?directory_cursor-7:0;
+  for(int i=first,y=143;i<ndirs&&y<405;i++,y+=33){
+   tile(r,175,y,440,29,i==directory_cursor);
+   const char*n=strrchr(dirs[i],'/');muted(r,184,y+8,n?n+1:dirs[i],2);
+  }
+  bottombar(r,"A OPEN  B UP  Y SCAN  X CLOSE");
+ }else{
+  if(!count)muted(r,178,223,"NO SAVES FOUND - PRESS X",2);
+  int first=selected>8?selected-8:0;
+  for(int i=first,y=105;i<count&&y<406;i++,y+=35){
+   tile(r,175,y,440,31,selected==i);
+   const char*n=strrchr(files[i],'/');muted(r,181,y+10,n?n+1:files[i],1);
+  }
+  bottombar(r,"A OPEN   X FOLDERS   START RESCAN");
+ }
+}
+
 int main(void){
  if(SDL_Init(SDL_INIT_VIDEO|SDL_INIT_GAMECONTROLLER))return 1;
- SDL_Window *w=SDL_CreateWindow("Pokemon Editor v1.1",SDL_WINDOWPOS_CENTERED,SDL_WINDOWPOS_CENTERED,640,480,SDL_WINDOW_FULLSCREEN_DESKTOP);
+ SDL_Window *w=SDL_CreateWindow("Pokemon Editor v1.3",SDL_WINDOWPOS_CENTERED,SDL_WINDOWPOS_CENTERED,640,480,SDL_WINDOW_FULLSCREEN_DESKTOP);
  if(!w){SDL_Quit();return 1;}
  SDL_Renderer *r=SDL_CreateRenderer(w,-1,SDL_RENDERER_SOFTWARE);
  if(!r){SDL_DestroyWindow(w);SDL_Quit();return 1;}
@@ -1041,16 +1269,16 @@ int main(void){
     if(b==SDL_CONTROLLER_BUTTON_DPAD_LEFT &&edit_field!=21)status=box_detail_adjust(edit_field,-1)?10:5;
     if(b==SDL_CONTROLLER_BUTTON_DPAD_RIGHT&&edit_field!=21)status=box_detail_adjust(edit_field,1)?10:5;
     if(b==SDL_CONTROLLER_BUTTON_A){
-     if(edit_field==21)delete_confirm=1;
+     if(edit_field==21 && !editor_party)delete_confirm=1;
      else status=box_detail_adjust(edit_field,1)?10:5;
     }
     if(b!=SDL_CONTROLLER_BUTTON_Y)continue;
    }
    if(b==SDL_CONTROLLER_BUTTON_Y){confirming=dirty&&save_game>0;status=save_game==0?15:dirty?0:8;continue;}
    if(b==SDL_CONTROLLER_BUTTON_B){if(dirty){status=14;}else{detail=0;status=0;}continue;}
-   if(b==SDL_CONTROLLER_BUTTON_LEFTSHOULDER){tab=(tab+4)%5;status=0;continue;}
-   if(b==SDL_CONTROLLER_BUTTON_RIGHTSHOULDER){tab=(tab+1)%5;status=0;continue;}
-   if(save_game==0 && tab!=4){status=15;continue;}
+   if(b==SDL_CONTROLLER_BUTTON_LEFTSHOULDER){tab=(tab+5)%6;status=0;continue;}
+   if(b==SDL_CONTROLLER_BUTTON_RIGHTSHOULDER){tab=(tab+1)%6;status=0;continue;}
+   if(save_game==0 && tab!=5){status=15;continue;}
    if(tab==0){
     if(b==SDL_CONTROLLER_BUTTON_DPAD_DOWN)bag_index=(bag_index+1)%(bag_raw_mode?575:bag_choice_count());
     if(b==SDL_CONTROLLER_BUTTON_DPAD_UP)bag_index=(bag_index+(bag_raw_mode?575:bag_choice_count())-1)%(bag_raw_mode?575:bag_choice_count());
@@ -1069,19 +1297,36 @@ int main(void){
     if(b==SDL_CONTROLLER_BUTTON_A||b==SDL_CONTROLLER_BUTTON_X){
      uint8_t mon[80];
      if(box_read(box_num,box_slot,mon)&&validate_box_mon(mon)){
-      pokemon_editor_open=1;edit_field=0;status=0;
-     }else if(b==SDL_CONTROLLER_BUTTON_A){tab=3;creator_mode=0;status=0;}
+      pokemon_editor_open=1;editor_party=0;edit_field=0;status=0;
+     }else if(b==SDL_CONTROLLER_BUTTON_A){tab=4;creator_mode=0;status=0;}
      else status=5;
     }
    }else if(tab==2){
+    if(b==SDL_CONTROLLER_BUTTON_DPAD_DOWN&&party_slot<party_count()-1)party_slot++;
+    if(b==SDL_CONTROLLER_BUTTON_DPAD_UP&&party_slot>0)party_slot--;
+    if(b==SDL_CONTROLLER_BUTTON_A&&party_count()>party_slot){
+     uint8_t mon[80];memcpy(mon,party(party_slot),80);
+     if(validate_box_mon(mon)){pokemon_editor_open=1;editor_party=1;edit_field=0;status=0;}
+     else status=5;
+    }
+   }else if(tab==3){
     if(b==SDL_CONTROLLER_BUTTON_DPAD_DOWN&&box_slot<24)box_slot+=6;
     if(b==SDL_CONTROLLER_BUTTON_DPAD_UP&&box_slot>=6)box_slot-=6;
     if(b==SDL_CONTROLLER_BUTTON_DPAD_LEFT&&box_slot%6>0)box_slot--;
     if(b==SDL_CONTROLLER_BUTTON_DPAD_RIGHT&&box_slot%6<5)box_slot++;
     if(b==SDL_CONTROLLER_BUTTON_START)box_num=(box_num+1)%14;
     if(b==SDL_CONTROLLER_BUTTON_X)odds_index=(odds_index+1)%8;
-    if(b==SDL_CONTROLLER_BUTTON_A)status=egg_create()?11:5;
-   }else if(tab==3){
+    if(b==SDL_CONTROLLER_BUTTON_BACK)egg_from_scratch=!egg_from_scratch;
+    if(b==SDL_CONTROLLER_BUTTON_START){egg_species++;if(egg_species>386)egg_species=1;}
+    if(b==SDL_CONTROLLER_BUTTON_DPAD_LEFT){egg_species--;if(egg_species<1)egg_species=386;}
+    if(b==SDL_CONTROLLER_BUTTON_DPAD_RIGHT){egg_species++;if(egg_species>386)egg_species=1;}
+    if(b==SDL_CONTROLLER_BUTTON_A){
+     int previous=creator_shiny;
+     creator_shiny=(egg_rng()%egg_odds[odds_index])==0;
+     status=(egg_from_scratch?egg_generate_fresh():egg_create())?11:5;
+     creator_shiny=previous;
+    }
+   }else if(tab==4){
     if(b==SDL_CONTROLLER_BUTTON_START){creator_mode=(creator_mode+1)%3;if(creator_mode==2)scan_pk3();}
     else if(creator_mode==0){
      if(b==SDL_CONTROLLER_BUTTON_DPAD_DOWN)creator_field=(creator_field+1)%12;
@@ -1099,183 +1344,44 @@ int main(void){
      if(b==SDL_CONTROLLER_BUTTON_DPAD_UP&&import_cursor>0)import_cursor--;
      if(b==SDL_CONTROLLER_BUTTON_A)status=import_pk3()?13:5;
     }
-   }else if(tab==4){
+   }else if(tab==5){
     if(b==SDL_CONTROLLER_BUTTON_A)status=backup()?1:2;
    }
   }
-  SDL_SetRenderDrawColor(r,12,17,30,255);SDL_RenderClear(r);
-  for(int y=56;y<450;y+=26)fill(r,0,y,640,1,18,25,42);
-  fill(r,0,0,640,58,26,39,67);
-  fill(r,0,0,7,58,90,205,202);
-  fill(r,0,56,640,2,73,107,147);
-  label(r,19,17,"POKEMON EDITOR",3);
-  chip(r,486,12,143,35,1);
-  label(r,499,22,"V1.1  MUOS",2);
-  if(folder_view){
-   label(r,20,72,"CHOOSE RETROARCH SAVE FOLDER",2);
-   panel(r,10,104,620,294);
-   const char *cp=strrchr(current_path,'/');label(r,18,114,cp&&cp[1]?cp+1:current_path,2);
-   int first=directory_cursor>5?directory_cursor-5:0;
-   for(int i=first,y=146;i<ndirs&&y<386;i++,y+=30){
-    if(i==directory_cursor)fill(r,12,y-3,610,28,41,97,119);
-    const char *name=strrchr(dirs[i],'/');label(r,20,y,name?name+1:dirs[i],2);
-   }
-   label(r,15,411,"A OPEN  B UP  L R ROOT",2);
-   label(r,15,441,"Y SCAN HERE  X EXIT",2);
-  }else if(!detail){
-   label(r,18,72,"RETROARCH SAVE FILES",2);
-   if(!count)label(r,20,168,"NO SAVES - PRESS X FOR FOLDERS",2);
-   int first=selected>7?selected-7:0;
-   for(int i=first,y=115;i<count&&y<393;i++,y+=34){
-    if(selected==i)fill(r,10,y-4,620,30,38,96,116);
-    const char *name=strrchr(files[i],'/');label(r,17,y,name?name+1:files[i],2);
-   }
-   label(r,18,413,"A OPEN  X FOLDERS  START RESCAN",2);
-   label(r,18,440,"R S E FR LG - BACK UP FIRST",2);
-  }else{
-   tabline(r);
-   if(tab==4){
-    panel(r,12,116,616,283);
-    const char *games[]={"UNIDENTIFIED","RUBY SAPPHIRE","FIRERED","LEAFGREEN","EMERALD"};
-    titleline(r,26,139,"SAVE HEALTH CHECK");
-    label(r,26,183,games[save_game],2);
-    label(r,26,215,save_slot_valid[0]?"SLOT A CHECKSUM: VALID":"SLOT A CHECKSUM: BAD",2);
-    label(r,26,245,save_slot_valid[1]?"SLOT B CHECKSUM: VALID":"SLOT B CHECKSUM: BAD",2);
-    label(r,26,275,save_game>0?"EDIT MODE - BACK UP BEFORE SAVING":"READ ONLY - EDITING DISABLED",2);
-    label(r,26,316,dirty?"UNSAVED MODIFICATIONS":"NO UNSAVED CHANGES",2);
-    label(r,26,357,"A MAKE NUMBERED BACKUP",2);
-   }else if(save_game==0){
-    panel(r,12,116,616,280);
-    label(r,26,150,"SAVE OPENED - READ ONLY",3);
-    label(r,26,213,"GAME EDITING NOT YET VALIDATED",2);
-    label(r,26,250,"HEALTH TAB SHOWS SAVE STATUS",2);
-    label(r,26,290,"YOU CAN MAKE A BACKUP THERE",2);
-   }else if(tab==0){
-    panel(r,12,116,616,274);
-    titleline(r,26,138,"BAG STORAGE");
-    label(r,26,177,bag_raw_mode?"ALL ITEM IDS - EXPERT MODE":catalog_names[catalog_game],2);
-    if(bag_raw_mode)number(r,26,218,"ITEM ID: %d",bag_index+1);
-    else label(r,26,218,bag_choice()->name,3);
-    number(r,460,170,"ITEM %d",bag_index+1);
-    number(r,460,197,"OF %d",bag_raw_mode?575:bag_choice_count());
-    number(r,26,275,"ADD AMOUNT: %d",bag_qty);
-    label(r,26,329,"START CATALOG RAW IDS  UP DOWN",2);
-    label(r,26,352,"A ADD ITEM TO SELECTED GAME",2);
-    label(r,26,375,"RAW IDS MAY BE INVALID IN GAME",2);
-   }else if(tab==3){
-    panel(r,12,115,616,306);
-    label(r,24,135,creator_mode==0?"NEW POKEMON":creator_mode==1?"EVENT RECREATIONS":"IMPORT ARCHIVED PK3",3);
-    if(creator_mode==2){
-     number(r,24,196,"PK3 FILES FOUND: %d",pk3_count);
-     if(pk3_count){const char *fn=strrchr(pk3_files[import_cursor],'/');
-      label(r,24,233,fn?fn+1:pk3_files[import_cursor],2);}
-     else label(r,24,233,"PLACE PK3 IN POKEMONEVENTS",2);
-     label(r,24,315,"UP DOWN SELECT  A IMPORT",2);
-    }else if(creator_mode==1){
-     label(r,24,190,event_pokemon[event_index].name,3);
-     pixel_mon(r,540,213,dex_to_internal(event_pokemon[event_index].dex),2);
-     number(r,24,241,"NATIONAL DEX: %d",event_pokemon[event_index].dex);
-     label(r,24,287,"RECONSTRUCTED - NOT ORIGINAL",2);
-     label(r,24,327,"UP DOWN EVENT   A CREATE",2);
-    }else{
-     const char *names[]={"SPECIES DEX","APPROX LEVEL","NATURE","ABILITY SLOT","HELD ITEM","MOVE 1","MOVE 2","MOVE 3","MOVE 4","ALL IVS","ALL EVS","SHINY"};
-     int vals[]={creator_dex,creator_level,creator_nature,creator_ability,creator_item,creator_moves[0],creator_moves[1],creator_moves[2],creator_moves[3],creator_iv,creator_ev,creator_shiny};
-     int first=creator_field>=6?6:0;
-     for(int j=first;j<first+6;j++){
-      int y=177+(j-first)*34;
-      if(j==creator_field)fill(r,18,y-5,600,29,40,96,118);
-      label(r,28,y,names[j],2);
-      number(r,390,y,"%d",vals[j]);
-     }
-     pixel_mon(r,525,310,dex_to_internal(creator_dex),2);
-     label(r,340,349,pokemon_names[creator_dex],2);
-     label(r,340,373,creator_shiny?"CREATE SHINY":"CREATE NORMAL",2);
-     label(r,24,393,"UP DOWN FIELD  LEFT RIGHT VALUE",2);
-    }
-    label(r,16,431,"A CREATE / IMPORT   START MODE",2);
-   }else{
-    panel(r,10,114,620,272);
-    fill(r,16,118,608,28,31,54,85);
-    number(r,26,125,"BOX %d / 14",box_num+1);
-    label(r,395,125,"START NEXT BOX",2);
-    for(int i=0;i<30;i++){
-     int x=21+i%6*101,y=157+i/6*44;
-     chip(r,x-3,y-4,93,40,i==box_slot);
-     int species_id=box_species_id(box_num,i);
-     if(species_id>0){
-      pixel_mon(r,x+1,y+1,species_id,1);
-      number(r,x+46,y+10,"%d",dex_for_internal(species_id));
-     }
-     else label(r,x+29,y+8,"--",2);
-    }
-    if(tab==1){
-     int selected_id=box_species_id(box_num,box_slot);
-     int selected_dex=dex_for_internal(selected_id);
-     if(selected_dex>0){
-      label(r,19,397,pokemon_names[selected_dex],3);
-      label(r,19,430,"A EDIT POKEMON   START NEXT BOX",2);
-     }else{
-      label(r,19,397,"EMPTY SLOT",3);
-      label(r,19,430,"A OPEN POKEMON CREATOR",2);
-     }
-    }else{
-     label(r,14,388,"EGG SOURCE: SELECT BOX POKEMON",2);
-     label(r,14,413,egg_odds_label[odds_index],2);
-    }
-   }
-   if(tab==4)label(r,16,441,"A BACKUP   L R TABS",2);
-   else if(tab==3)label(r,16,451,"X SHINY IN CREATOR",2);
-   else if(tab==2)label(r,16,441,"A MAKE EGG  X ODDS  START BOX",2);
-   else if(tab==1)label(r,16,459,"Y SAVE CHANGES  X EDIT POKEMON",2);
-   else label(r,16,441,"Y SAVE  L R TABS  START BOX",2);
-  }
-  if(pokemon_editor_open && detail && !folder_view){
-   fill(r,0,57,640,397,10,17,32);
-   fill(r,8,65,624,2,92,195,199);
-   label(r,21,78,"EDIT POKEMON",3);
-   number(r,420,83,"BOX %d",box_num+1);
-   number(r,520,83,"SLOT %d",box_slot+1);
-   panel(r,12,119,225,295);
-   panel(r,248,119,380,295);
-   int dex=box_detail_value(0);
-   if(dex>0&&dex<=386){
-    pixel_mon(r,73,161,dex_to_internal(dex),3);
-    label(r,24,290,pokemon_names[dex],3);
-    label(r,24,328,box_current_shiny()==1?"SHINY POKEMON":"NORMAL POKEMON",2);
-   }
-   label(r,24,373,"CURRENT POKEMON",2);
-   int first=(edit_field/7)*7;
-   for(int i=first;i<EDITOR_FIELD_COUNT&&i<first+7;i++){
-    int y=139+(i-first)*38;
-    if(i==edit_field)fill(r,255,y-6,365,32,39,95,116);
-    label(r,264,y,box_editor_labels[i],2);
-    if(i!=21){
-     int v=box_detail_value(i);
-     if(i==3)label(r,555,y,v==1?"YES":"NO",2);
-     else number(r,560,y,"%d",v);
-    }
-   }
-   label(r,15,426,"UP DOWN FIELD  LEFT RIGHT VALUE",2);
-   label(r,15,449,"A CHANGE   B BACK   Y SAVE",2);
+  SDL_SetRenderDrawColor(r,11,18,31,255);SDL_RenderClear(r);
+  if(!detail || folder_view)draw_browser(r);
+  else{
+   dashboard(r);
+   if(tab==0)draw_bag(r);
+   else if(tab==1)draw_box(r);
+   else if(tab==2)draw_party(r);
+   else if(tab==3)draw_eggs(r);
+   else if(tab==4)draw_events(r);
+   else draw_health(r);
+   if(pokemon_editor_open)draw_editor(r);
   }
   if(delete_confirm){
-   fill(r,32,160,576,165,14,32,48);
-   label(r,55,182,"DELETE SELECTED POKEMON?",3);
-   label(r,55,233,"THIS REMOVES THE PC SLOT",2);
-   label(r,55,255,"SAVE REQUIRED TO COMMIT",2);
-   label(r,55,280,"A DELETE    B CANCEL",2);
+   fill(r,167,157,455,174,13,37,54);
+   fill(r,167,157,455,3,219,115,119);
+   label(r,185,179,"DELETE POKEMON?",3);
+   muted(r,185,235,"A DELETE  B CANCEL",2);
+   muted(r,185,270,"SAVE NEEDED TO COMMIT",2);
   }
   if(confirming){
-   fill(r,32,160,576,165,14,32,48);
-   label(r,55,182,"SAVE TO ORIGINAL FILE?",3);
-   label(r,55,233,"CLOSE RETROARCH BEFORE SAVING",2);
-   label(r,55,255,"BACKUP WILL BE MADE FIRST",2);
-   label(r,55,280,"A YES    B CANCEL",2);
+   fill(r,167,157,455,174,13,37,54);
+   fill(r,167,157,455,3,99,231,213);
+   label(r,185,179,"SAVE CHANGES?",3);
+   muted(r,185,223,"CLOSE RETROARCH FIRST",2);
+   muted(r,185,257,"BACKUP CREATED AUTOMATICALLY",1);
+   aqua(r,185,287,"A CONFIRM  B CANCEL",2);
   }
   if(status){
-   const char *msgs[]={"","BACKUP CREATED","BACKUP FAILED","INVALID SAVE","SAVED TO GAME FILE","OPERATION FAILED","FOLDER FOUND","FOLDER EMPTY","NOTHING TO SAVE","UNSAVED CHANGES LOST","CHANGE STAGED","EGG ADDED TO PC","POKEMON DELETED","EVENT MON STAGED","SAVE OR RELOAD BEFORE EXIT","READ ONLY SAVE"};
-   if(status>=1&&status<=15){fill(r,6,454,628,26,38,78,92);label(r,13,460,msgs[status],2);}
-  }else if(detail&&!confirming)label(r,520,460,dirty?"UNSAVED":"CLEAN",2);
+   const char*msgs[]={"","BACKUP CREATED","BACKUP FAILED","INVALID SAVE","SAVED TO GAME FILE","OPERATION FAILED","FOLDER FOUND","FOLDER EMPTY","NOTHING TO SAVE","UNSAVED CHANGES LOST","CHANGE STAGED","EGG ADDED TO PC","POKEMON DELETED","EVENT MON STAGED","SAVE OR RELOAD BEFORE EXIT","READ ONLY SAVE"};
+   if(status>=1&&status<=15){
+    fill(r,157,443,476,34,38,87,91);
+    label(r,167,453,msgs[status],2);
+   }
+  }else if(detail&&!confirming){muted(r,559,16,dirty?"UNSAVED":"READY",1);}
   SDL_RenderPresent(r);SDL_Delay(16);
  }
  if(mini_atlas)SDL_DestroyTexture(mini_atlas);
