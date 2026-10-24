@@ -22,6 +22,111 @@ static uint8_t data[SAVE_SIZE], snapshot[SAVE_SIZE];
 static int dirty=0, confirming=0, odds_index=0, egg_species=1, edit_field=0, pokemon_editor_open=0, folder_view=0, root_index=0, party_slot=0, editor_party=0, egg_from_scratch=1;
 static int catalog_game=0, delete_confirm=0, event_index=0, save_game=0, save_slot_valid[2]={0,0}, tool_cursor=0, creator_dex=151, bag_raw_mode=0, import_mode=0, import_cursor=0;
 static char root_custom[512]="";
+/* e-Reader workshop: exports editable card specifications only, not raw
+   scanner-ready e-Reader dotcodes or unsupported save injections. */
+static int ecard_type=0, ecard_field=0, ecard_dex=151, ecard_level=30;
+static int ecard_berry=0, ecard_trainer=0, ecard_saved=0;
+static const char *ecard_types[]={"EON TICKET REF","BATTLE E TRAINER","E CARD BERRY","CUSTOM TRAINER"};
+static const char *ecard_berries[]={"PUMKIN","DRASH","EGGANT","STRIB","CHILAN","NUTPEA","GINEMA","KICE","YAGO","TOUGA"};
+static const char *ecard_trainers[]={"YOUNGSTER","LASS","ACE TRAINER","POKEMON FAN","GENTLEMAN","POKEMANIAC"};
+
+
+/* Card library: imports card files as inert data, never executes content. */
+#include "bundled_me3.h"
+#define MAX_ECARDS 256
+static char ecard_files[MAX_ECARDS][512];
+static int ecard_count=0,ecard_cursor=0,ecard_mode=0;
+static const char *ecard_exts[]={".raw",".bin",".wc3",".me3",".ecb",".sav"};
+static const char *ecard_card_roots[]={
+ "/run/muos/storage/application/PokemonSaveBrowser/cards",
+ "/mnt/mmc/PokemonEvents", "/mnt/sdcard/PokemonEvents",
+ "/mnt/mmc/EREADER", "/mnt/sdcard/EREADER",
+ "/run/muos/storage/roms/PokemonEvents"
+};
+static int ecard_extension(const char *name){
+ size_t n=strlen(name);
+ for(unsigned i=0;i<sizeof(ecard_exts)/sizeof(ecard_exts[0]);i++){
+  size_t k=strlen(ecard_exts[i]);
+  if(n>=k&&!strcasecmp(name+n-k,ecard_exts[i]))return 1;
+ }
+ return 0;
+}
+static void ecard_search(const char *dir,int depth){
+ if(depth>3||ecard_count>=MAX_ECARDS)return;
+ DIR *d=opendir(dir);if(!d)return;
+ struct dirent *e;
+ while((e=readdir(d))&&ecard_count<MAX_ECARDS){
+  if(e->d_name[0]=='.')continue;
+  char path[512];
+  if(snprintf(path,sizeof(path),"%s/%s",dir,e->d_name)>=(int)sizeof(path))continue;
+  struct stat st;if(lstat(path,&st))continue;
+  if(S_ISLNK(st.st_mode))continue;
+  if(S_ISDIR(st.st_mode))ecard_search(path,depth+1);
+  else if(S_ISREG(st.st_mode)&&st.st_size>0&&st.st_size<=1024*1024&&ecard_extension(path)){
+   snprintf(ecard_files[ecard_count++],512,"%s",path);
+  }
+ }
+ closedir(d);
+}
+static void ecard_scan(void){
+ ecard_count=0;ecard_cursor=0;
+ for(int i=0;i<EMBEDDED_EVENT_COUNT && ecard_count<MAX_ECARDS;i++){
+  snprintf(ecard_files[ecard_count++],512,"BUILT-IN/%s.me3",embedded_events[i].name);
+ }
+ for(unsigned i=0;i<sizeof(ecard_card_roots)/sizeof(ecard_card_roots[0]);i++)
+  ecard_search(ecard_card_roots[i],0);
+}
+static int ecard_import(void){
+ if(ecard_count<=0||ecard_cursor>=ecard_count)return 0;
+ const char *source=ecard_files[ecard_cursor];
+ /* Existing in-app cards are already imported. */
+ const char *targetdir=ecard_card_roots[0];
+ if(strncmp(source,targetdir,strlen(targetdir))==0)return 1;
+ if(mkdir(targetdir,0755)&&errno!=EEXIST)return 0;
+ const char *base=strrchr(source,'/');base=base?base+1:source;
+ if(strstr(base,"..")||strlen(base)>120)return 0;
+ char dst[640];int found=0;
+ for(int n=1;n<=999;n++){
+  if(snprintf(dst,sizeof(dst),"%s/%03d-%s",targetdir,n,base)>=(int)sizeof(dst))return 0;
+  if(access(dst,F_OK)!=0){found=1;break;}
+ }
+ if(!found)return 0;
+ FILE *in=fopen(source,"rb");if(!in)return 0;
+ int fd=open(dst,O_CREAT|O_EXCL|O_WRONLY,0644);
+ if(fd<0){fclose(in);return 0;}
+ char buf[4096];size_t n;int ok=1;size_t total=0;
+ while((n=fread(buf,1,sizeof(buf),in))>0){
+  total+=n;if(total>1024*1024){ok=0;break;}
+  size_t off=0;while(off<n){ssize_t w=write(fd,buf+off,n-off);if(w<=0){ok=0;break;}off+=(size_t)w;}
+  if(!ok)break;
+ }
+ if(ferror(in)||fsync(fd))ok=0;
+ if(close(fd))ok=0;
+ fclose(in);
+ if(!ok)unlink(dst);
+ return ok;
+}
+/* Ruby/Sapphire Mystery Event (.me3) injector.
+ * Based on Gen3 Mystery Event save research: SaveBlock1 logical section 4,
+ * script block offset 0x810, 1004 bytes including 4-byte header;
+ * optional Record Mixing Gift at 0xBFC (8 bytes).
+ * Game/version detection elsewhere currently uses the filename and therefore
+ * needs manual review before release on unknown saves.
+ */
+#define ME3_SCRIPT_SIZE 1004
+#define ME3_RECORD_SIZE 8
+static int me3_validate(const uint8_t *b,size_t n){
+ if(n!=ME3_SCRIPT_SIZE && n!=ME3_SCRIPT_SIZE+ME3_RECORD_SIZE)return 0;
+ /* Ruby/Sapphire MysteryEvent3RS checksum: 16-bit byte sum over 1000 data bytes. */
+ uint32_t sum=0;for(int i=4;i<ME3_SCRIPT_SIZE;i++)sum+=b[i];
+ if((uint16_t)sum!=(uint16_t)(b[0]|(b[1]<<8)))return 0;
+ if(n==ME3_SCRIPT_SIZE+ME3_RECORD_SIZE){
+  uint32_t record=0;
+  for(int i=ME3_SCRIPT_SIZE+4;i<ME3_SCRIPT_SIZE+8;i++)record+=b[i];
+  if((uint16_t)record!=(uint16_t)(b[ME3_SCRIPT_SIZE]|(b[ME3_SCRIPT_SIZE+1]<<8)))return 0;
+ }
+ return 1;
+}
 static const char *root_paths[]={"/run/muos/storage/save", "/run/muos/storage/roms", "/mnt/mmc/SAVES", "/mnt/sdcard/SAVES", "/mnt/mmc/ROMS", "/mnt/sdcard/ROMS", "/mnt/mmc/RetroArch/saves", "/mnt/sdcard/RetroArch/saves", "/mnt/mmc/MUOS/save", "/mnt/sdcard/MUOS/save", "/mnt/mmc", "/mnt/sdcard"};
 #define ROOT_COUNT ((int)(sizeof(root_paths)/sizeof(root_paths[0])))
 static char current_path[512]="/run/muos/storage/save";
@@ -69,6 +174,54 @@ static int load(const char *path){
  if(!va&&!vb)return 0;
  active=vb&&(!va||(int32_t)(cb-ca)>0)?1:0;
  memcpy(sec,active?b:a,sizeof(sec));memcpy(snapshot,data,SAVE_SIZE);dirty=0;return 1;
+}
+/* Stage a validated ME3 event into a Ruby/Sapphire save. Do not write
+ * the original file until the user uses the usual Y -> A save confirmation.
+ * Do not apply scripts from unknown/untrusted sources. */
+static int apply_me3_selected(void){
+ if(save_game!=1||active<0||ecard_count<1||ecard_cursor>=ecard_count)return 0;
+ const char *path=ecard_files[ecard_cursor];
+ size_t l=strlen(path);
+ if(l<4||strcasecmp(path+l-4,".me3"))return 0;
+  uint8_t event[ME3_SCRIPT_SIZE+ME3_RECORD_SIZE];
+  size_t n=0;
+  if(!strncmp(path,"BUILT-IN/",9)){
+   int found=0;
+   for(int i=0;i<EMBEDDED_EVENT_COUNT;i++){
+    char virtual_path[128];
+    snprintf(virtual_path,sizeof(virtual_path),"BUILT-IN/%s.me3",embedded_events[i].name);
+    if(!strcmp(path,virtual_path)){
+     n=embedded_events[i].size;
+     memcpy(event,embedded_events[i].bytes,n);
+     found=1;break;
+    }
+   }
+   if(!found)return 0;
+  }else{
+   struct stat st;
+   if(stat(path,&st)||(st.st_size!=ME3_SCRIPT_SIZE&&st.st_size!=ME3_SCRIPT_SIZE+ME3_RECORD_SIZE))return 0;
+   FILE *f=fopen(path,"rb");if(!f)return 0;
+   n=fread(event,1,(size_t)st.st_size,f);
+   int bad=ferror(f);fclose(f);
+   if(bad||n!=(size_t)st.st_size)return 0;
+  }
+  if(!me3_validate(event,n))return 0;
+ /* Script replacement is intentionally explicit. Existing Mystery Event
+  * data is overwritten when staged; an untouched backup is made when saved. */
+ uint8_t *section4=data+sec[4]*SECTION_SIZE;
+ memcpy(section4+0x810,event,ME3_SCRIPT_SIZE);
+ /* A script without a record-mixing gift must clear any previous gift. */
+ if(n==ME3_SCRIPT_SIZE+ME3_RECORD_SIZE)
+  memcpy(section4+0xBFC,event+ME3_SCRIPT_SIZE,ME3_RECORD_SIZE);
+ else memset(section4+0xBFC,0,ME3_RECORD_SIZE);
+ wr16(section4+0xFF6,checksum(section4,lengths[4]));
+ /* Enable Mystery Event availability / Petalburg NPC in Ruby/Sapphire. */
+ uint8_t *section2=data+sec[2]*SECTION_SIZE;
+ section2[0x3A9]|=0x40;
+ section2[0x5C0]|=0x04;
+ wr16(section2+0xFF6,checksum(section2,lengths[2]));
+ dirty=1;
+ return 1;
 }
 static int party_offset(void){return (save_game==2||save_game==3)?0x34:0x234;}
 static int party_count(void){
@@ -1006,12 +1159,12 @@ static void dashboard(SDL_Renderer*r){
  fill(r,0,0,640,4,87,212,193);
  aqua(r,14,18,"POKEMON",3);
  label(r,14,48,"EDITOR",3);
- muted(r,14,80,"MUOS  V1.3",2);
- const char *names[]={"BAG","PC BOX","PARTY","EGG LAB","EVENTS","HEALTH"};
- for(int i=0;i<6;i++){
-  int y=125+i*48;
-  tile(r,8,y,133,41,tab==i);
-  if(tab==i)aqua(r,20,y+13,names[i],2);else muted(r,20,y+13,names[i],2);
+ muted(r,14,80,"MUOS  V1.4",2);
+ const char *names[]={"BAG","PC BOX","PARTY","EGG LAB","EVENTS","E READER","HEALTH"};
+ for(int i=0;i<7;i++){
+  int y=125+i*43;
+  tile(r,8,y,133,38,tab==i);
+  if(tab==i)aqua(r,20,y+12,names[i],2);else muted(r,20,y+12,names[i],2);
  }
  muted(r,11,438,"L/R TABS",2);
  fill(r,151,74,489,1,42,63,83);
@@ -1128,6 +1281,84 @@ static void draw_events(SDL_Renderer*r){
  }
  bottombar(r,"START MODE   D-PAD EDIT   A APPLY");
 }
+
+static int export_ecard_definition(void){
+ if(selected<0||selected>=count||save_game!=1&&save_game!=4)return 0;
+ char target[640];
+ if(!unique_path(files[selected],"ereader-card.txt",target,sizeof(target)))return 0;
+ /* Only an editable descriptor. No GBA save bytes are changed. */
+ FILE *f=fopen(target,"wx");if(!f)return 0;
+ int ok=fprintf(f,
+  "POKEMON EDITOR E-READER CARD SPEC V1\n"
+  "Type: %s\n"
+  "Game: %s\n"
+  "Compatibility: %s\n"
+  "Pokemon National Dex: %d\n"
+  "Pokemon Name: %s\n"
+  "Level: %d\n"
+  "Trainer class: %s\n"
+  "Berry: %s\n"
+  "Status: DESIGN ONLY - NOT SCANNABLE; DOES NOT ACTIVATE AN EVENT\n",
+  ecard_types[ecard_type],save_game==1?"RUBY / SAPPHIRE":"EMERALD",
+  save_game==4?"EMERALD NEEDS COMPATIBLE ROM/CARD PIPELINE":"VERIFY CARD REGION AND VERSION",
+  ecard_dex,pokemon_names[ecard_dex],ecard_level,
+  ecard_trainers[ecard_trainer],ecard_berries[ecard_berry])>0;
+ if(fflush(f)!=0)ok=0;
+ if(fclose(f)!=0)ok=0;
+ if(!ok)unlink(target);
+ ecard_saved=ok;
+ return ok;
+}
+static void adjust_ecard(int delta){
+ switch(ecard_field){
+  case 0: ecard_type=(ecard_type+4+delta)%4;break;
+  case 1: ecard_dex=(ecard_dex-1+386+delta)%386+1;break;
+  case 2: ecard_level=(ecard_level-1+100+delta)%100+1;break;
+  case 3: ecard_trainer=(ecard_trainer+6+delta)%6;break;
+  case 4: ecard_berry=(ecard_berry+10+delta)%10;break;
+ }
+}
+static void draw_ereader(SDL_Renderer*r){
+ head(r,"E READER WORKSHOP",ecard_mode?"IMPORTED AND CUSTOM CARD FILES":"DESIGN CUSTOM EVENT REFERENCES");
+ panel(r,163,91,465,334);
+ if(ecard_mode){
+  sectiontitle(r,178,107,"BUILT-IN EVENTS + SD CARDS");
+  number(r,469,109,"FILES %d",ecard_count);
+  int first=ecard_cursor>6?ecard_cursor-6:0;
+  for(int i=first;i<ecard_count&&i<first+7;i++){
+   int y=141+(i-first)*32;
+   tile(r,177,y,437,29,i==ecard_cursor);
+   const char *name=strrchr(ecard_files[i],'/');name=name?name+1:ecard_files[i];
+   char shortname[49];snprintf(shortname,sizeof(shortname),"%.44s",name);
+   muted(r,185,y+8,shortname,1);
+  }
+  if(!ecard_count)muted(r,187,197,"NO CARD FILES FOUND",2);
+  if(ecard_count>0){
+   const char *p=ecard_files[ecard_cursor];size_t n=strlen(p);
+   if(n>=4&&!strcasecmp(p+n-4,".me3")&&save_game==1)
+    aqua(r,182,359,"A STAGE ME3 EVENT",2);
+   else muted(r,182,359,"NOT INJECTABLE AS RS ME3",1);
+  }
+  muted(r,182,385,"X COPY CARD TO LIBRARY",1);
+  bottombar(r,"START DESIGN  A STAGE EVENT  Y SAVE");
+ }else{
+  sectiontitle(r,178,109,"DESIGN A CUSTOM CARD");
+  const char *fields[]={"CARD TYPE","POKEMON","LEVEL","TRAINER CLASS","E CARD BERRY"};
+  for(int i=0;i<5;i++){
+   int y=145+i*47;
+   tile(r,177,y,435,40,i==ecard_field);
+   muted(r,186,y+7,fields[i],1);
+   if(i==0)aqua(r,186,y+20,ecard_types[ecard_type],2);
+   else if(i==1)aqua(r,186,y+20,pokemon_names[ecard_dex],2);
+   else if(i==2)number(r,186,y+20,"LEVEL %d",ecard_level);
+   else if(i==3)aqua(r,186,y+20,ecard_trainers[ecard_trainer],2);
+   else aqua(r,186,y+20,ecard_berries[ecard_berry],2);
+  }
+  muted(r,179,392,"A EXPORT DESIGN FILE",2);
+  bottombar(r,"START LIBRARY  D-PAD EDIT  A EXPORT");
+ }
+}
+
 static void draw_health(SDL_Renderer*r){
  head(r,"SAVE HEALTH","CHECK DATA AND BACK UP SAFELY");
  panel(r,163,91,465,334);
@@ -1198,7 +1429,7 @@ static void draw_browser(SDL_Renderer*r){
 
 int main(void){
  if(SDL_Init(SDL_INIT_VIDEO|SDL_INIT_GAMECONTROLLER))return 1;
- SDL_Window *w=SDL_CreateWindow("Pokemon Editor v1.3",SDL_WINDOWPOS_CENTERED,SDL_WINDOWPOS_CENTERED,640,480,SDL_WINDOW_FULLSCREEN_DESKTOP);
+ SDL_Window *w=SDL_CreateWindow("Pokemon Editor v1.6",SDL_WINDOWPOS_CENTERED,SDL_WINDOWPOS_CENTERED,640,480,SDL_WINDOW_FULLSCREEN_DESKTOP);
  if(!w){SDL_Quit();return 1;}
  SDL_Renderer *r=SDL_CreateRenderer(w,-1,SDL_RENDERER_SOFTWARE);
  if(!r){SDL_DestroyWindow(w);SDL_Quit();return 1;}
@@ -1276,9 +1507,9 @@ int main(void){
    }
    if(b==SDL_CONTROLLER_BUTTON_Y){confirming=dirty&&save_game>0;status=save_game==0?15:dirty?0:8;continue;}
    if(b==SDL_CONTROLLER_BUTTON_B){if(dirty){status=14;}else{detail=0;status=0;}continue;}
-   if(b==SDL_CONTROLLER_BUTTON_LEFTSHOULDER){tab=(tab+5)%6;status=0;continue;}
-   if(b==SDL_CONTROLLER_BUTTON_RIGHTSHOULDER){tab=(tab+1)%6;status=0;continue;}
-   if(save_game==0 && tab!=5){status=15;continue;}
+   if(b==SDL_CONTROLLER_BUTTON_LEFTSHOULDER){tab=(tab+6)%7;status=0;continue;}
+   if(b==SDL_CONTROLLER_BUTTON_RIGHTSHOULDER){tab=(tab+1)%7;status=0;continue;}
+   if(save_game==0 && tab!=6){status=15;continue;}
    if(tab==0){
     if(b==SDL_CONTROLLER_BUTTON_DPAD_DOWN)bag_index=(bag_index+1)%(bag_raw_mode?575:bag_choice_count());
     if(b==SDL_CONTROLLER_BUTTON_DPAD_UP)bag_index=(bag_index+(bag_raw_mode?575:bag_choice_count())-1)%(bag_raw_mode?575:bag_choice_count());
@@ -1345,6 +1576,23 @@ int main(void){
      if(b==SDL_CONTROLLER_BUTTON_A)status=import_pk3()?13:5;
     }
    }else if(tab==5){
+    if(save_game!=1&&save_game!=4){status=15;continue;}
+    if(b==SDL_CONTROLLER_BUTTON_START){ecard_mode=!ecard_mode;if(ecard_mode)ecard_scan();status=0;}
+    else if(ecard_mode){
+     if(b==SDL_CONTROLLER_BUTTON_DPAD_DOWN&&ecard_cursor<ecard_count-1)ecard_cursor++;
+     if(b==SDL_CONTROLLER_BUTTON_DPAD_UP&&ecard_cursor>0)ecard_cursor--;
+     if(b==SDL_CONTROLLER_BUTTON_X){status=ecard_import()?17:5;ecard_scan();}
+     if(b==SDL_CONTROLLER_BUTTON_A){
+      status=apply_me3_selected()?18:19;
+     }
+    }else{
+     if(b==SDL_CONTROLLER_BUTTON_DPAD_UP)ecard_field=(ecard_field+4)%5;
+     if(b==SDL_CONTROLLER_BUTTON_DPAD_DOWN)ecard_field=(ecard_field+1)%5;
+     if(b==SDL_CONTROLLER_BUTTON_DPAD_LEFT)adjust_ecard(-1);
+     if(b==SDL_CONTROLLER_BUTTON_DPAD_RIGHT)adjust_ecard(1);
+     if(b==SDL_CONTROLLER_BUTTON_A)status=export_ecard_definition()?16:5;
+    }
+   }else if(tab==6){
     if(b==SDL_CONTROLLER_BUTTON_A)status=backup()?1:2;
    }
   }
@@ -1357,6 +1605,7 @@ int main(void){
    else if(tab==2)draw_party(r);
    else if(tab==3)draw_eggs(r);
    else if(tab==4)draw_events(r);
+   else if(tab==5)draw_ereader(r);
    else draw_health(r);
    if(pokemon_editor_open)draw_editor(r);
   }
@@ -1376,8 +1625,8 @@ int main(void){
    aqua(r,185,287,"A CONFIRM  B CANCEL",2);
   }
   if(status){
-   const char*msgs[]={"","BACKUP CREATED","BACKUP FAILED","INVALID SAVE","SAVED TO GAME FILE","OPERATION FAILED","FOLDER FOUND","FOLDER EMPTY","NOTHING TO SAVE","UNSAVED CHANGES LOST","CHANGE STAGED","EGG ADDED TO PC","POKEMON DELETED","EVENT MON STAGED","SAVE OR RELOAD BEFORE EXIT","READ ONLY SAVE"};
-   if(status>=1&&status<=15){
+   const char*msgs[]={"","BACKUP CREATED","BACKUP FAILED","INVALID SAVE","SAVED TO GAME FILE","OPERATION FAILED","FOLDER FOUND","FOLDER EMPTY","NOTHING TO SAVE","UNSAVED CHANGES LOST","CHANGE STAGED","EGG ADDED TO PC","POKEMON DELETED","EVENT MON STAGED","SAVE OR RELOAD BEFORE EXIT","READ ONLY SAVE","CARD SPEC FILE EXPORTED","CARD FILE IMPORTED","ME3 STAGED - Y SAVE","ME3 REJECTED / NOT RS"};
+   if(status>=1&&status<=19){
     fill(r,157,443,476,34,38,87,91);
     label(r,167,453,msgs[status],2);
    }
